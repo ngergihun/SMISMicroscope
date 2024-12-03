@@ -1,0 +1,18 @@
+#Comment: 
+#Describes some characteristics and preferences
+---
+name: Transfer Microscope #key-value
+components: 
+  - stage #first list item
+  - camera #second list item
+stage:
+  type: linear
+  axes: 2
+  javascript: Beginner
+camera: 
+  - brand: IDS 
+  - fruits: 
+      citrics: oranges 
+      tropical: bananas
+      nuts: peanuts
+      sweets: raisins

@@ -1,0 +1,806 @@
+# -*- coding: utf-8 -*-
+"""
+GUI app for home-built microscope with OSC (open stepper controller) motor controller and IDS camera
+Standalone app
+@author: Gergely Németh
+"""
+
+#General modules
+import sys
+import os
+import numpy as np
+from enum import Enum
+from time import sleep
+import logging
+
+# GUI modules
+from PySide6 import QtWidgets, QtGui
+from PySide6 import QtCore
+from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer
+import pyqtgraph as pg
+pg.setConfigOption('useNumba', True)
+pg.setConfigOption('imageAxisOrder', 'row-major')
+
+# Logging config
+logging.basicConfig(format="%(message)s", level=logging.INFO)
+
+# Stepper controller package
+import serialStepper
+from serialStepper.cmd import move_modes
+from serialStepper import linear
+
+class units(Enum):
+    steps = 0
+    microns = 1
+class step_mode(Enum):
+    relative = 0
+    absolute = 1
+
+# Joystick package
+import pyspacemouse
+
+# Camera packages
+from ids_peak import ids_peak
+from ids_peak_ipl import ids_peak_ipl
+from ids_peak import ids_peak_ipl_extension
+
+FPS_LIMIT = 50
+TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
+# TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_BGRa8
+
+# UI import
+ui_file_name = 'microscope_app.ui'
+current_folder = os.getcwd()
+ui_file_path = os.path.join(current_folder,ui_file_name)
+
+uiclass, baseclass = pg.Qt.loadUiType(ui_file_path)
+
+class CameraThread(QObject):
+    """Qt thread handling the camera reading independently from the UI"""
+    progress = Signal()
+
+    def __init__(self):
+        super().__init__()
+        self.image = []
+
+        self.__device = None
+        self.__nodemap_remote_device = None
+        self.__datastream = None
+
+        # self.__display = None
+        self.__acquisition_timer = QTimer(self)
+        self.__acquisition_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.__acquisition_timer.timeout.connect(self.on_acquisition_timer)
+        self.__frame_counter = 0
+        self.__error_counter = 0
+        self.__acquisition_running = False
+
+        self.__label_infos = None
+        # self.__label_version = None
+        # self.__label_aboutqt = None
+
+        self.__image_converter = ids_peak_ipl.ImageConverter()
+
+        # initialize peak library
+        ids_peak.Library.Initialize()
+
+        if self.__open_device():
+            try:
+                # Create a display for the camera image
+                if not self.__start_acquisition():
+                    QtWidgets.QMessageBox.critical(self, "Error", "Unable to start acquisition!", QtWidgets.QMessageBox.Ok)
+            except Exception as e:
+                QtWidgets.QMessageBox.critical(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
+        else:
+            self.__destroy_all()
+
+    def __open_device(self):
+        try:
+            # Create instance of the device manager
+            device_manager = ids_peak.DeviceManager.Instance()
+            # Update the device manager
+            device_manager.Update()
+            # Return if no device was found
+            if device_manager.Devices().empty():
+                # QtWidgets.QMessageBox.critical(self.parent, "Error", "No device found!", QtWidgets.QMessageBox.Ok)
+                return False
+            # Open the first openable device in the managers device list
+            for device in device_manager.Devices():
+                if device.IsOpenable():
+                    self.__device = device.OpenDevice(ids_peak.DeviceAccessType_Control)
+                    break
+            # Return if no device could be opened
+            if self.__device is None:
+                QtWidgets.QMessageBox.critical(self.parent, "Error", "Device could not be opened!", QtWidgets.QMessageBox.Ok)
+                return False
+            # Open standard data stream
+            datastreams = self.__device.DataStreams()
+            if datastreams.empty():
+                QtWidgets.QMessageBox.critical(self, "Error", "Device has no DataStream!", QtWidgets.QMessageBox.Ok)
+                self.__device = None
+                return False
+
+            self.__datastream = datastreams[0].OpenDataStream()
+
+            # Get nodemap of the remote device for all accesses to the genicam nodemap tree
+            self.__nodemap_remote_device = self.__device.RemoteDevice().NodeMaps()[0]
+
+            # To prepare for untriggered continuous image acquisition, load the default user set if available and
+            # wait until execution is finished
+            try:
+                self.__nodemap_remote_device.FindNode("UserSetSelector").SetCurrentEntry("Default")
+                self.__nodemap_remote_device.FindNode("UserSetLoad").Execute()
+                self.__nodemap_remote_device.FindNode("UserSetLoad").WaitUntilDone()
+            except ids_peak.Exception:
+                # Userset is not available
+                pass
+
+            # Get the payload size for correct buffer allocation
+            payload_size = self.__nodemap_remote_device.FindNode("PayloadSize").Value()
+
+            # Get minimum number of buffers that must be announced
+            buffer_count_max = self.__datastream.NumBuffersAnnouncedMinRequired()
+
+            # Allocate and announce image buffers and queue them
+            for i in range(buffer_count_max):
+                buffer = self.__datastream.AllocAndAnnounceBuffer(payload_size)
+                self.__datastream.QueueBuffer(buffer)
+
+            return True
+        except ids_peak.Exception as e:
+            QtWidgets.QMessageBox.critical(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
+
+        return False
+
+    def __close_device(self):
+        """
+        Stop acquisition if still running and close datastream and nodemap of the device
+        """
+        # Stop Acquisition in case it is still running
+        self.__stop_acquisition()
+
+        # If a datastream has been opened, try to revoke its image buffers
+        if self.__datastream is not None:
+            try:
+                for buffer in self.__datastream.AnnouncedBuffers():
+                    self.__datastream.RevokeBuffer(buffer)
+            except Exception as e:
+                QtWidgets.QMessageBox.information(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
+
+    def __start_acquisition(self):
+        """
+        Start Acquisition on camera and start the acquisition timer to receive and display images
+
+        :return: True/False if acquisition start was successful
+        """
+        # Check that a device is opened and that the acquisition is NOT running. If not, return.
+        if self.__device is None:
+            return False
+        if self.__acquisition_running is True:
+            return True
+
+        # Get the maximum framerate possible, limit it to the configured FPS_LIMIT. If the limit can't be reached, set
+        # acquisition interval to the maximum possible framerate
+        try:
+            max_fps = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
+            target_fps = min(max_fps, FPS_LIMIT)
+            self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").SetValue(target_fps)
+        except ids_peak.Exception:
+            # AcquisitionFrameRate is not available. Unable to limit fps. Print warning and continue on.
+            QtWidgets.QMessageBox.warning(self, "Warning",
+                                "Unable to limit fps, since the AcquisitionFrameRate Node is"
+                                " not supported by the connected camera. Program will continue without limit.")
+            
+        self.__acquisition_timer.setInterval((1 / target_fps) * 1000)
+        
+        try:
+            # Lock critical features to prevent them from changing during acquisition
+            self.__nodemap_remote_device.FindNode("TLParamsLocked").SetValue(1)
+
+            image_width = self.__nodemap_remote_device.FindNode("Width").Value()
+            image_height = self.__nodemap_remote_device.FindNode("Height").Value()
+            input_pixel_format = ids_peak_ipl.PixelFormat(
+                self.__nodemap_remote_device.FindNode("PixelFormat").CurrentEntry().Value())
+
+            # Pre-allocate conversion buffers to speed up first image conversion
+            # while the acquisition is running
+            # NOTE: Re-create the image converter, so old conversion buffers
+            #       get freed
+            self.__image_converter = ids_peak_ipl.ImageConverter()
+            self.__image_converter.PreAllocateConversion(
+                input_pixel_format, TARGET_PIXEL_FORMAT,
+                image_width, image_height)
+
+            # Start acquisition on camera
+            self.__datastream.StartAcquisition()
+            self.__nodemap_remote_device.FindNode("AcquisitionStart").Execute()
+            self.__nodemap_remote_device.FindNode("AcquisitionStart").WaitUntilDone()
+        except Exception as e:
+            logging.error("Exception: " + str(e))
+            return False
+
+        # Start acquisition timer
+        self.__acquisition_timer.start()
+        self.__acquisition_running = True
+
+        return True
+
+    def __stop_acquisition(self):
+        """
+        Stop acquisition timer and stop acquisition on camera
+        :return:
+        """
+        # Check that a device is opened and that the acquisition is running. If not, return.
+        if self.__device is None or self.__acquisition_running is False:
+            return
+
+        # Otherwise try to stop acquisition
+        try:
+            remote_nodemap = self.__device.RemoteDevice().NodeMaps()[0]
+            remote_nodemap.FindNode("AcquisitionStop").Execute()
+
+            # Stop and flush datastream
+            self.__datastream.KillWait()
+            self.__datastream.StopAcquisition(ids_peak.AcquisitionStopMode_Default)
+            self.__datastream.Flush(ids_peak.DataStreamFlushMode_DiscardAll)
+
+            self.__acquisition_timer.stop()
+            self.__acquisition_running = False
+
+            # Unlock parameters after acquisition stop
+            if self.__nodemap_remote_device is not None:
+                try:
+                    self.__nodemap_remote_device.FindNode("TLParamsLocked").SetValue(0)
+                except Exception as e:
+                    QtWidgets.QMessageBox.information(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
+
+        except Exception as e:
+            QtWidgets.QMessageBox.information(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
+
+    def __del__(self):
+        self.__destroy_all()
+
+    def __destroy_all(self):
+        # Stop acquisition
+        self.__stop_acquisition()
+        # Close device and peak library
+        self.__close_device()
+        ids_peak.Library.Close()
+
+    @Slot()
+    def on_acquisition_timer(self):
+        """
+        This function gets called on every timeout of the acquisition timer
+        """
+        try:
+            # Get buffer from device's datastream
+            buffer = self.__datastream.WaitForFinishedBuffer(5000)
+            # Create IDS peak IPL image for debayering and convert it to RGBa8 format
+            ipl_image = ids_peak_ipl_extension.BufferToImage(buffer)
+            converted_ipl_image = self.__image_converter.Convert(ipl_image, TARGET_PIXEL_FORMAT)
+            # Queue buffer so that it can be used again
+            self.__datastream.QueueBuffer(buffer)
+            # Get raw image data from converted image and construct a QImage from it
+            image = converted_ipl_image.get_numpy_3D()
+            # Make an extra copy of the QImage to make sure that memory is copied and can't get overwritten later on
+            self.image = np.ascontiguousarray(image.copy(), dtype="uint8")
+            # Emit signal that the image is ready to be displayed
+            self.progress.emit()
+            # Increase frame counter
+            self.__frame_counter += 1
+
+        except ids_peak.Exception as e:
+            self.__error_counter += 1
+            logging.error("Exception: " + str(e))
+
+    @Slot()
+    def on_exposure_change(self,value):
+        # self.__stop_acquisition()
+        newfps = round(1000000/value,1)
+        self.set_fps(newfps)
+        self.__nodemap_remote_device.FindNode("ExposureTime").SetValue(value)
+        # self.__start_acquisition()
+
+    def set_fps(self,fps):
+        # Get the maximum framerate possible, limit it to the configured fps_limit. If the limit can't be reached, set
+        # acquisition interval to the maximum possible framerate
+        try:
+            max_fps = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
+            target_fps = min(max_fps, fps)
+            self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").SetValue(target_fps)
+        except ids_peak.Exception:
+            # AcquisitionFrameRate is not available. Unable to limit fps. Print warning and continue on.
+            logging.warning("Warning: Unable to limit fps, since the AcquisitionFrameRate." +
+                            "Program will continue without limit.")
+            
+        # Setup acquisition timer accordingly
+        self.__acquisition_timer.setInterval((1 / fps) * 1000)
+
+class MotorThread(QObject):
+    """Qt thread handling the motor control (including joystick handling) independently from the UI"""
+    pos_updated = Signal()
+
+    def __init__(self, port="COM10", address_x="0", address_y="1",debug=False):
+        super().__init__()
+
+        self.stageport = port
+        self.xpos = None
+        self.ypos = None
+        self.zpos = 0
+        self.moving = False
+        self.target_xmove = 0
+        self.target_ymove = 0
+        self.target_zmove = 0
+        self.unit = units.steps
+
+        self.xthreadpitch = 0.5039370078740157/1.008
+        self.ythreadpitch = 0.5039370078740157/1.008
+
+        self.x_enabled = True
+        self.y_enabled = True
+        self.z_enabled = False
+
+        self.speed_range = "Low"
+
+        # Private objects
+        self.__stage_controller = None
+        self.__stage = None
+        self.__button_motor = None
+
+        # Private flags
+        self.__joystick_enabled = False
+        self.__success_mouse_open = None
+
+        # Private settings
+        self.__joystick_poll_time = 1
+
+        self.is_stage_available = False
+        self.is_stage_available = self.__init_stage(port=self.stageport,address_x=address_x,address_y=address_y,debug=False)
+
+        logging.info(f"Stage ready? {self.is_stage_available}")
+
+        if self.is_stage_available:
+            self.__init_timers()
+
+    def __init_stage(self, port="COM10", address_x="0",address_y="1",debug=False):
+        # Initialize the stage controller
+        try:
+            self.__stage_controller = serialStepper.Controller(port, debug=False)
+            self.__stage = serialStepper.TwoAxisStage(controller=self.__stage_controller, 
+                                                    address_x=address_x, 
+                                                    address_y=address_y,
+                                                    debug=debug)
+            self.__stage.xmotor.threadpitch = self.xthreadpitch
+            self.__stage.ymotor.threadpitch = self.ythreadpitch
+
+            for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+                self.__set_stage_speed(motor, speed=0.5)
+            
+            logging.info("Stage setup succesfull!")
+            return True
+        except:
+            return False
+        
+    def __init_timers(self):
+        self.__timer_joystick = QTimer(self)
+        self.__timer_joystick.setTimerType(QtCore.Qt.PreciseTimer)
+        self.__timer_joystick.timeout.connect(self.__read_joystick)
+
+        self.__timer_pos_update = QTimer(self)
+        self.__timer_pos_update.setTimerType(QtCore.Qt.PreciseTimer)
+        self.__timer_pos_update.timeout.connect(self.__read_position)
+        self.__timer_pos_update.start(100)
+
+    def __read_position(self):
+        if self.unit == units.steps:
+            self.xpos = self.__stage.xmotor.get_position()
+            self.ypos = self.__stage.ymotor.get_position()
+        elif self.unit == units.microns:
+            self.xpos = self.__stage.xmotor.get_distance()
+            self.ypos = self.__stage.ymotor.get_distance()
+
+        self.moving = self.__stage.is_moving()
+
+        self.pos_updated.emit()
+
+    def __set_stage_speed(self, motor, speed=1):
+        newv = int(motor.microsteps_per_rev * speed)
+        newa = newv * 4
+        if self.__joystick_enabled:
+            motor.set_mode(move_modes.ramp)
+        motor.set_maxvelocity(vmax=newv)
+        motor.set_maxacceleration(amax=newa)
+        if self.__joystick_enabled:
+            motor.set_mode(move_modes.velocity)
+
+    def __read_joystick(self):
+        if self.__joystick_enabled:
+            state = pyspacemouse.read()
+            if self.x_enabled:
+                self.__stage.xmotor.set_targetvelocity(speed=int(state.x*2047))
+
+            if self.y_enabled:
+                self.__stage.ymotor.set_targetvelocity(speed=int(state.y*2047))
+
+            if self.z_enabled:
+                pass
+
+    def __activate_pointmove(self):
+        self.__timer_joystick.stop()
+        self.__joystick_enabled = False
+        if self.__success_mouse_open is not None:
+            self.__success_mouse_open.close()
+
+        for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+            motor.set_mode(move_modes.ramp)
+        logging.info("Set Ramp mode")
+
+    def __activate_velocitymove(self):
+        self.__timer_joystick.start(self.__joystick_poll_time)
+        self.__joystick_enabled = True
+        try:
+            self.__success_mouse_open = pyspacemouse.open()
+            self.on_speed_selection_changed(self.speed_range)
+        except:
+            self.__success_mouse_open = None
+            QtWidgets.QMessageBox.warning(self, "Warning","Could not open 3D mouse!")
+        if self.__success_mouse_open is not None:
+            # Set the motors to velocity mode
+            for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+                motor.set_mode(move_modes.velocity)
+            logging.info("Set Velocity mode")
+        else:
+            QtWidgets.QMessageBox.warning(self, "Warning","Could access 3D mouse!")
+
+    @Slot()
+    def move_to_point(self,relative=True,stepunit=True):
+        """ Moves the stage to a relative or absolute coordinate specified in either step or real units"""
+
+        test = QTimer(self)
+        test.setTimerType(QtCore.Qt.PreciseTimer)
+        test.timeout.connect(print("test"))
+        
+        if relative is False:
+            self.__stage.go_to_point(xdistance=self.target_xmove,
+                                   ydistance=self.target_ymove,
+                                   step_units=stepunit)
+        elif relative is True:
+            self.__stage.move(xdistance=self.target_xmove,
+                            ydistance=self.target_ymove,
+                            step_units=stepunit)
+        else:
+            logging.info("Movement definition is not clear!")
+        
+    @Slot()
+    def reset_position(self):
+        """ Slot: Set the current position of the stage motors to ZERO"""
+        for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+            motor.set_position(pos=0)
+            if self.__joystick_enabled:
+                motor.set_mode(mode=move_modes.velocity)
+        logging.info("Current position was reset to zero!")
+
+    @Slot()
+    def on_position_update(self):
+        self.__read_position()
+        self.pos_updated.emit()
+    
+    @Slot()
+    def on_control_mode_change(self, tabindex):
+        if tabindex == 0:
+            self.__activate_pointmove()
+
+        elif tabindex == 1:
+            self.__activate_velocitymove()
+
+    @Slot()
+    def on_speed_selection_changed(self, buttontext):
+        if buttontext == "Low":
+            for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+                self.__set_stage_speed(motor, speed=0.5)               
+
+        elif buttontext == "Mid":
+            for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+                self.__set_stage_speed(motor, speed=1)
+
+        elif buttontext == "High":
+            for motor in [self.__stage.xmotor, self.__stage.ymotor]:
+                self.__set_stage_speed(motor, speed=2)
+
+        self.speed_range = buttontext
+
+    @Slot()
+    def on_button_move(self,button_name):
+        self.__joystick_enabled = False
+        if button_name == "y_up":
+            self.__button_motor = self.__stage.ymotor
+            self.__button_motor.set_targetvelocity(speed=int(2047))
+        elif button_name == "y_down":
+            self.__button_motor = self.__stage.ymotor
+            self.__button_motor.set_targetvelocity(speed=int(-1*2047))
+        elif button_name == "x_right":
+            self.__button_motor = self.__stage.xmotor
+            self.__button_motor.set_targetvelocity(speed=int(2047))
+        elif button_name == "x_left":
+            self.__button_motor = self.__stage.xmotor
+            self.__button_motor.set_targetvelocity(speed=int(-1*2047))
+        elif button_name == "":
+            self.__button_motor.set_targetvelocity(speed=int(0))
+            self.__joystick_enabled = True
+            
+class MicroscopeApp(uiclass, baseclass):
+    move_command_signal = Signal(bool,bool)
+    motorspeed_change_signal = Signal(str)
+    button_move_command = Signal(str)
+    set_exposure_signal = Signal(int)
+
+    def __init__(self):
+        super().__init__()
+
+        # Initialize the user interface from the generated module
+        self.setupUi(self)
+
+        # Create the CAMERA worker thread
+        self.camera_worker = CameraThread()
+        self.camera_thread = QThread()
+        self.camera_worker.progress.connect(self.update_image)
+        self.camera_worker.moveToThread(self.camera_thread)
+        self.camera_thread.start()
+
+        self.microns_per_pixel = 0.24
+
+        # Create the STAGE CONTROLLER worker thread
+        self.motor_worker = MotorThread(port="COM10", address_x="1", address_y="0")
+        self.motor_thread = QThread()
+        # self.motor_worker.pos_updated.connect(self.position_label_update)
+        self.motor_worker.moveToThread(self.motor_thread)
+        self.motor_thread.start()
+
+        # SIGNAL connects to MOTOR related command signals and buttons
+        self.click_move_enabled = False
+        self.click_move_button.clicked.connect(self.click_move_enable)
+        if self.motor_worker.is_stage_available:
+            # Position update
+            self.motor_worker.pos_updated.connect(self.position_label_update)
+            self.motor_worker.pos_updated.connect(self.update_image_scales)
+            # Tab change to control mode change (joystick/velocity or pointmove/ramp mode)
+            self.control_tab.currentChanged.connect(self.motor_worker.on_control_mode_change)
+            # Speed switch radiobuttons
+            self.low_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.low_speed_radio))
+            self.mid_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.mid_speed_radio))
+            self.high_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.high_speed_radio))
+            # Unit switch radiobuttons
+            self.steps_radio.toggled.connect(lambda: self.distance_unit_changed(self.steps_radio))
+            self.microns_radio.toggled.connect(lambda: self.distance_unit_changed(self.microns_radio))
+            # Move and position reset buttons
+            self.move_button.clicked.connect(self.move_to_buttoncall)
+            self.move_command_signal.connect(self.motor_worker.move_to_point)
+            self.reset_pos_button.clicked.connect(self.motor_worker.reset_position)
+            self.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
+            # Connect move button signals
+            self.y_up.pressed.connect(lambda: self.movebutton_on_click(self.y_up))
+            self.y_up.released.connect(lambda: self.movebutton_on_release(self.y_up))
+            self.y_up.setShortcut(QtGui.QKeySequence.MoveToPreviousLine)
+            self.y_down.pressed.connect(lambda: self.movebutton_on_click(self.y_down))
+            self.y_down.released.connect(lambda: self.movebutton_on_release(self.y_down))
+            self.y_down.setShortcut(QtGui.QKeySequence.MoveToNextLine)
+            self.x_right.pressed.connect(lambda: self.movebutton_on_click(self.x_right))
+            self.x_right.released.connect(lambda: self.movebutton_on_release(self.x_right))
+            self.x_right.setShortcut(QtGui.QKeySequence.MoveToPreviousChar)
+            self.x_left.pressed.connect(lambda: self.movebutton_on_click(self.x_left))
+            self.x_left.released.connect(lambda: self.movebutton_on_release(self.x_left))
+            self.x_left.setShortcut(QtGui.QKeySequence.MoveToNextChar)
+            # Connect axis lock checkboxes
+            self.x_lock_switch.stateChanged.connect(self.on_axis_lock_change)
+            self.y_lock_switch.stateChanged.connect(self.on_axis_lock_change)
+            self.z_lock_switch.stateChanged.connect(self.on_axis_lock_change)
+
+            # UI state initial setups
+            if (self.motor_worker.xthreadpitch == None or self.motor_worker.ythreadpitch == None):
+                self.unit = units.steps
+                self.steps_radio.setChecked(True)
+                self.motor_worker.unit = units.steps
+            else:
+                self.unit = units.microns
+                self.motor_worker.unit = units.microns
+                self.microns_radio.setChecked(True)
+
+            self.control_tab.currentChanged.emit(self.control_tab.currentIndex())
+
+        # CAMERA CONTROL UI INTEMS
+        self.exposure_slider.valueChanged.connect(self.set_exposure)
+        self.set_exposure_signal.connect(self.camera_worker.on_exposure_change)
+        self.gain_slider.valueChanged.connect(self.set_gain)
+        self.camera_start_button.clicked.connect(self.start_camera)
+
+        # IMAGE DISPLAY AREA SETUP
+        init_image = np.ones((2076,3088,4), dtype="uint8")
+        self.imItem = pg.ImageItem(init_image, autoLevels=False)             # create an ImageItem
+        self.image_view_area.addItem(self.imItem)                                                   # add it to the PlotWidget
+        self.image_view_area.setBackground('w')
+        self.image_view_area.setAspectLocked(True)
+        self.image_view_area.invertY(True)
+        self.image_view_area.getAxis('left').setTextPen('black')
+        self.image_view_area.getAxis('bottom').setTextPen('black')
+        self.image_view_area.setMouseTracking(True)                                                 # For cursor tracking
+        self.imItem.hoverEvent = self.imageHoverEvent                                               # Attach event
+        self.imItem.mouseClickEvent = self.imageClickEvent                                          # Attach event
+        self.crosshair_vLine = pg.InfiniteLine(angle=90, movable=False)
+        self.crosshair_hLine = pg.InfiniteLine(angle=0, movable=False)
+        self.image_view_area.addItem(self.crosshair_vLine, ignoreBounds=True)
+        self.image_view_area.addItem(self.crosshair_hLine, ignoreBounds=True)
+
+        tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
+        tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
+        tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
+        self.imItem.setTransform(tr)
+        self.image_view_area.getAxis('bottom').setLabel('X position / μm')
+        self.image_view_area.getAxis('left').setLabel('Y position / μm')
+        self.image_view_area.showAxes(True)
+        self.image_view_area.setAspectLocked(True)
+
+        # STATUSBAR CUSTOMIZATION
+        status_bar_layout = QtWidgets.QHBoxLayout()
+        status_bar_layout.setContentsMargins(0, 0, 0, 0)
+        self.general_status_label = QtWidgets.QLabel(self.statusbar)
+        self.general_status_label.setAlignment(QtCore.Qt.AlignLeft)
+        status_bar_layout.addWidget(self.general_status_label)
+        status_bar_layout.addStretch()
+        self.camera_status_label = QtWidgets.QLabel(self.statusbar)
+        self.camera_status_label.setAlignment(QtCore.Qt.AlignRight)
+        status_bar_layout.addWidget(self.camera_status_label)
+        self.statusbar.setLayout(status_bar_layout)
+
+    def position_label_update(self):
+        """ Gets the position from the motor thread and updates the labels"""
+        if self.motor_worker.unit == units.steps:
+            unit_string = ""
+        elif self.motor_worker.unit == units.microns:
+            unit_string = "μm"
+        self.xpos_label.setText(f'X: {round(self.motor_worker.xpos,2)} {unit_string}')
+        self.ypos_label.setText(f'Y: {round(self.motor_worker.ypos,2)} {unit_string}')
+        self.zpos_label.setText(f'Z: {round(self.motor_worker.zpos,2)} {unit_string}')
+        
+    def move_to_buttoncall(self):
+        self.motor_worker.target_xmove = self.xmove_spinbox.value()
+        self.motor_worker.target_ymove = self.ymove_spinbox.value()
+        self.motor_worker.target_zmove = self.zmove_spinbox.value()
+
+        unitbool = (self.motor_worker.unit == units.steps)
+
+        if self.relative_move_radio.isChecked():
+            self.move_command_signal.emit(True,unitbool)
+
+        if self.absolute_move_radio.isChecked():
+            self.move_command_signal.emit(False,unitbool)
+
+    def distance_unit_changed(self, button):
+        if button.isChecked():
+            if button.text() == "steps":
+                self.motor_worker.unit = units.steps
+            elif button.text() == "microns":
+                self.motor_worker.unit = units.microns
+            else:
+                pass
+
+    def speed_selection_changed(self, button):
+        if button.isChecked():
+            self.motorspeed_change_signal.emit(button.text())
+
+    def movebutton_on_release(self, button):
+        """ Turns off the motor moved by the buttons"""
+        # self.
+        self.button_move_command.emit("")
+
+    def movebutton_on_click(self, button):
+        self.button_move_command.emit(button.objectName())
+
+    def on_axis_lock_change(self):
+        self.motor_worker.x_enabled = self.x_lock_switch.isChecked()
+        self.motor_worker.y_enabled = self.y_lock_switch.isChecked()
+        self.motor_worker.z_enabled = self.z_lock_switch.isChecked()
+
+    def imageClickEvent(self, event):
+        if self.click_move_enabled:
+            # Get mouse position
+            pos = event.pos()
+            ppos = self.imItem.mapToParent(pos)
+            x, y = ppos.x(), ppos.y()
+            
+            # Go to position
+            # xpix_move = 3088/2-x
+            # self.motor_worker.target_xmove = self.pixel_to_distance(xpix_move)
+            # ypix_move = y-2076/2
+            # self.motor_worker.target_ymove = self.pixel_to_distance(ypix_move)
+
+            self.motor_worker.target_xmove = -x
+            self.motor_worker.target_ymove = y
+
+            logging.info(f"X pixel coordinate: {x}, Y pixel coordinate {y}")
+            # self.motor_worker.move_to_point(True,False)
+            self.move_command_signal.emit(False,False)
+
+    def imageHoverEvent(self,event):
+        # Show the position, pixel, and value under the mouse cursor.
+        if event.isExit():
+            self.image_view_area.setTitle("")
+            return
+        pos = event.pos()
+        i, j = pos.y(), pos.x()
+        # i = int(np.clip(i, 0, self.imItem.image.shape[0] - 1))
+        # j = int(np.clip(j, 0, self.imItem.image.shape[1] - 1))
+        # val = self.imItem.image[i, j]
+        ppos = self.imItem.mapToParent(pos)
+        x, y = ppos.x(), ppos.y()
+        # self.image_view_area.setTitle("pos: (%0.1f, %0.1f)  pixel: (%d, %d)  value: %.3g" % (x, y, i, j, val))
+        self.image_view_area.setTitle("pos: (%0.1f, %0.1f)  pixel: (%d, %d)"  % (x, y, i, j))
+
+    def click_move_enable(self):
+        if self.click_move_button.isChecked():
+            self.click_move_enabled = True
+        else:
+            self.click_move_enabled = False
+
+    def update_image_scales(self):
+        tr = self.imItem.transform()
+
+        newdx = -3088/2*self.microns_per_pixel-self.motor_worker.xpos
+        newdy = -2076/2*self.microns_per_pixel+self.motor_worker.ypos
+
+        if self.motor_worker.unit == units.microns:
+            tr.reset()
+            tr.translate(newdx,newdy)
+            tr.scale(self.microns_per_pixel,self.microns_per_pixel)
+            self.imItem.setTransform(tr)
+            self.crosshair_vLine.setPos(self.motor_worker.xpos*-1.0)
+            self.crosshair_hLine.setPos(self.motor_worker.ypos)
+        elif self.motor_worker.unit == units.steps:
+            pass
+
+# CAMERA RELATED FUNCTIONS
+    def start_camera(self):
+        pass
+
+    def update_image(self):
+        self.imItem.setImage(image=self.camera_worker.image, autoLevels=False, levels=None, lut=False, autoDownsample=False)
+        # self.image_view_area.setImage(self.camera_worker.image)
+
+    def set_exposure(self):
+        value = self.exposure_slider.value()
+        disp_string = f"{value} ms"
+        self.exposure_display.setText(disp_string)
+        # Set camera as well
+        self.set_exposure_signal.emit(value*1000)
+
+    def set_gain(self):
+        value = self.gain_slider.value()
+        disp_string = f"{value}"
+        self.gain_display.setText(disp_string)
+        # Set camera as well
+
+    def pixel_to_distance(self, pixels):
+        return self.microns_per_pixel*pixels
+
+    def closeEvent(self, event):
+        quit_msg = "Are you sure you want to exit the program?"
+        logging.info(quit_msg)
+        reply = QtWidgets.QMessageBox.question(self, 'Message', quit_msg, QtWidgets.QMessageBox.Yes, QtWidgets.QMessageBox.No)
+
+        if reply == QtWidgets.QMessageBox.Yes:
+            event.accept()
+            try:
+                self.stage_controller.close()
+                logging.info(f'{self.stage_controller.port} port closed')
+            except:
+                pass
+        else:
+            event.ignore()
+
+class SingleImage():
+    """Class for storing image data from the microscope"""
+
+if __name__ == '__main__':
+    app = QtWidgets.QApplication(sys.argv)
+    ex = MicroscopeApp()
+    ex.show()
+    sys.exit(app.exec())
