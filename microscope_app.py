@@ -44,6 +44,8 @@ from ids_peak import ids_peak
 from ids_peak_ipl import ids_peak_ipl
 from ids_peak import ids_peak_ipl_extension
 
+from camera.camera import IDS_Camera
+
 FPS_LIMIT = 50
 TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
 # TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_BGRa8
@@ -61,260 +63,93 @@ class CameraThread(QObject):
 
     def __init__(self):
         super().__init__()
-        self.image = []
 
-        self.__device = None
-        self.__nodemap_remote_device = None
-        self.__datastream = None
+        # try:
+        self.camera = IDS_Camera()
+        # except:
+            # self.camera = None
 
-        # self.__display = None
-        self.__acquisition_timer = QTimer(self)
-        self.__acquisition_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self.__acquisition_timer.timeout.connect(self.on_acquisition_timer)
-        self.__frame_counter = 0
-        self.__error_counter = 0
-        self.__acquisition_running = False
-
-        self.__label_infos = None
-        # self.__label_version = None
-        # self.__label_aboutqt = None
-
-        self.__image_converter = ids_peak_ipl.ImageConverter()
-
-        # initialize peak library
-        ids_peak.Library.Initialize()
-
-        if self.__open_device():
-            try:
-                # Create a display for the camera image
-                if not self.__start_acquisition():
-                    QtWidgets.QMessageBox.critical(self, "Error", "Unable to start acquisition!", QtWidgets.QMessageBox.Ok)
-            except Exception as e:
-                QtWidgets.QMessageBox.critical(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
+        if self.camera.open_device():
+            logging.info(f"Camera: {self.camera.name}")
+            # try:
+            #     # Create a display for the camera image
+            #     if not self.camera.start_camera():
+            #        logging.critical("Unable to start acquisition!")
+            # except Exception as e:
+            #     logging.critical("Exception" + str(e))
         else:
-            self.__destroy_all()
+            self.camera.destroy_all()
 
-    def __open_device(self):
-        try:
-            # Create instance of the device manager
-            device_manager = ids_peak.DeviceManager.Instance()
-            # Update the device manager
-            device_manager.Update()
-            # Return if no device was found
-            if device_manager.Devices().empty():
-                # QtWidgets.QMessageBox.critical(self.parent, "Error", "No device found!", QtWidgets.QMessageBox.Ok)
-                return False
-            # Open the first openable device in the managers device list
-            for device in device_manager.Devices():
-                if device.IsOpenable():
-                    self.__device = device.OpenDevice(ids_peak.DeviceAccessType_Control)
-                    break
-            # Return if no device could be opened
-            if self.__device is None:
-                QtWidgets.QMessageBox.critical(self.parent, "Error", "Device could not be opened!", QtWidgets.QMessageBox.Ok)
-                return False
-            # Open standard data stream
-            datastreams = self.__device.DataStreams()
-            if datastreams.empty():
-                QtWidgets.QMessageBox.critical(self, "Error", "Device has no DataStream!", QtWidgets.QMessageBox.Ok)
-                self.__device = None
-                return False
+        # Timers
+        self.__freerun_timer = QTimer(self)
+        self.__freerun_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        # self.__freerun_timer.setSingleShot(False)
+        self.__freerun_timer.timeout.connect(self.__on_freerun_timer)
 
-            self.__datastream = datastreams[0].OpenDataStream()
+        # Flags set by the UI thread
+        self.__freerun_enabled = False
 
-            # Get nodemap of the remote device for all accesses to the genicam nodemap tree
-            self.__nodemap_remote_device = self.__device.RemoteDevice().NodeMaps()[0]
+        # Other
+        self.__freerun_error_counter = 0
 
-            # To prepare for untriggered continuous image acquisition, load the default user set if available and
-            # wait until execution is finished
-            try:
-                self.__nodemap_remote_device.FindNode("UserSetSelector").SetCurrentEntry("Default")
-                self.__nodemap_remote_device.FindNode("UserSetLoad").Execute()
-                self.__nodemap_remote_device.FindNode("UserSetLoad").WaitUntilDone()
-            except ids_peak.Exception:
-                # Userset is not available
-                pass
-
-            # Get the payload size for correct buffer allocation
-            payload_size = self.__nodemap_remote_device.FindNode("PayloadSize").Value()
-
-            # Get minimum number of buffers that must be announced
-            buffer_count_max = self.__datastream.NumBuffersAnnouncedMinRequired()
-
-            # Allocate and announce image buffers and queue them
-            for i in range(buffer_count_max):
-                buffer = self.__datastream.AllocAndAnnounceBuffer(payload_size)
-                self.__datastream.QueueBuffer(buffer)
-
-            return True
-        except ids_peak.Exception as e:
-            QtWidgets.QMessageBox.critical(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
-
-        return False
-
-    def __close_device(self):
-        """
-        Stop acquisition if still running and close datastream and nodemap of the device
-        """
-        # Stop Acquisition in case it is still running
-        self.__stop_acquisition()
-
-        # If a datastream has been opened, try to revoke its image buffers
-        if self.__datastream is not None:
-            try:
-                for buffer in self.__datastream.AnnouncedBuffers():
-                    self.__datastream.RevokeBuffer(buffer)
-            except Exception as e:
-                QtWidgets.QMessageBox.information(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
-
-    def __start_acquisition(self):
+    @Slot()
+    def start_freerun(self):
         """
         Start Acquisition on camera and start the acquisition timer to receive and display images
 
         :return: True/False if acquisition start was successful
         """
         # Check that a device is opened and that the acquisition is NOT running. If not, return.
-        if self.__device is None:
+        if self.camera.device is None:
             return False
-        if self.__acquisition_running is True:
-            return True
 
         # Get the maximum framerate possible, limit it to the configured FPS_LIMIT. If the limit can't be reached, set
         # acquisition interval to the maximum possible framerate
-        try:
-            max_fps = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
-            target_fps = min(max_fps, FPS_LIMIT)
-            self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").SetValue(target_fps)
-        except ids_peak.Exception:
-            # AcquisitionFrameRate is not available. Unable to limit fps. Print warning and continue on.
-            QtWidgets.QMessageBox.warning(self, "Warning",
-                                "Unable to limit fps, since the AcquisitionFrameRate Node is"
-                                " not supported by the connected camera. Program will continue without limit.")
-            
-        self.__acquisition_timer.setInterval((1 / target_fps) * 1000)
         
-        try:
-            # Lock critical features to prevent them from changing during acquisition
-            self.__nodemap_remote_device.FindNode("TLParamsLocked").SetValue(1)
-
-            image_width = self.__nodemap_remote_device.FindNode("Width").Value()
-            image_height = self.__nodemap_remote_device.FindNode("Height").Value()
-            input_pixel_format = ids_peak_ipl.PixelFormat(
-                self.__nodemap_remote_device.FindNode("PixelFormat").CurrentEntry().Value())
-
-            # Pre-allocate conversion buffers to speed up first image conversion
-            # while the acquisition is running
-            # NOTE: Re-create the image converter, so old conversion buffers
-            #       get freed
-            self.__image_converter = ids_peak_ipl.ImageConverter()
-            self.__image_converter.PreAllocateConversion(
-                input_pixel_format, TARGET_PIXEL_FORMAT,
-                image_width, image_height)
-
-            # Start acquisition on camera
-            self.__datastream.StartAcquisition()
-            self.__nodemap_remote_device.FindNode("AcquisitionStart").Execute()
-            self.__nodemap_remote_device.FindNode("AcquisitionStart").WaitUntilDone()
-        except Exception as e:
-            logging.error("Exception: " + str(e))
+        if self.camera.set_continuous():
+            self.__freerun_enabled = True
+            self.__freerun_timer.setInterval(int(1 / self.camera.framerate) * 1000)
+            self.__freerun_timer.start()
+            logging.info("Freerun started")
+            return True
+        else:
+            logging.error("Could not start acquisition!")
             return False
-
-        # Start acquisition timer
-        self.__acquisition_timer.start()
-        self.__acquisition_running = True
-
-        return True
-
-    def __stop_acquisition(self):
+   
+    @Slot()
+    def stop_freerun(self):
         """
         Stop acquisition timer and stop acquisition on camera
         :return:
         """
-        # Check that a device is opened and that the acquisition is running. If not, return.
-        if self.__device is None or self.__acquisition_running is False:
-            return
-
-        # Otherwise try to stop acquisition
-        try:
-            remote_nodemap = self.__device.RemoteDevice().NodeMaps()[0]
-            remote_nodemap.FindNode("AcquisitionStop").Execute()
-
-            # Stop and flush datastream
-            self.__datastream.KillWait()
-            self.__datastream.StopAcquisition(ids_peak.AcquisitionStopMode_Default)
-            self.__datastream.Flush(ids_peak.DataStreamFlushMode_DiscardAll)
-
-            self.__acquisition_timer.stop()
-            self.__acquisition_running = False
-
-            # Unlock parameters after acquisition stop
-            if self.__nodemap_remote_device is not None:
-                try:
-                    self.__nodemap_remote_device.FindNode("TLParamsLocked").SetValue(0)
-                except Exception as e:
-                    QtWidgets.QMessageBox.information(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
-
-        except Exception as e:
-            QtWidgets.QMessageBox.information(self, "Exception", str(e), QtWidgets.QMessageBox.Ok)
-
-    def __del__(self):
-        self.__destroy_all()
-
-    def __destroy_all(self):
-        # Stop acquisition
-        self.__stop_acquisition()
-        # Close device and peak library
-        self.__close_device()
-        ids_peak.Library.Close()
-
-    @Slot()
-    def on_acquisition_timer(self):
-        """
-        This function gets called on every timeout of the acquisition timer
-        """
-        try:
-            # Get buffer from device's datastream
-            buffer = self.__datastream.WaitForFinishedBuffer(5000)
-            # Create IDS peak IPL image for debayering and convert it to RGBa8 format
-            ipl_image = ids_peak_ipl_extension.BufferToImage(buffer)
-            converted_ipl_image = self.__image_converter.Convert(ipl_image, TARGET_PIXEL_FORMAT)
-            # Queue buffer so that it can be used again
-            self.__datastream.QueueBuffer(buffer)
-            # Get raw image data from converted image and construct a QImage from it
-            image = converted_ipl_image.get_numpy_3D()
-            # Make an extra copy of the QImage to make sure that memory is copied and can't get overwritten later on
-            self.image = np.ascontiguousarray(image.copy(), dtype="uint8")
-            # Emit signal that the image is ready to be displayed
-            self.progress.emit()
-            # Increase frame counter
-            self.__frame_counter += 1
-
-        except ids_peak.Exception as e:
-            self.__error_counter += 1
-            logging.error("Exception: " + str(e))
-
+        logging.info("Freerun stopped")
+        self.__freerun_timer.stop()
+        self.camera.stop_acquisition()
+        self.__freerun_enabled = False
+    
     @Slot()
     def on_exposure_change(self,value):
         # self.__stop_acquisition()
         newfps = round(1000000/value,1)
-        self.set_fps(newfps)
-        self.__nodemap_remote_device.FindNode("ExposureTime").SetValue(value)
-        # self.__start_acquisition()
-
-    def set_fps(self,fps):
-        # Get the maximum framerate possible, limit it to the configured fps_limit. If the limit can't be reached, set
-        # acquisition interval to the maximum possible framerate
-        try:
-            max_fps = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
-            target_fps = min(max_fps, fps)
-            self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").SetValue(target_fps)
-        except ids_peak.Exception:
-            # AcquisitionFrameRate is not available. Unable to limit fps. Print warning and continue on.
-            logging.warning("Warning: Unable to limit fps, since the AcquisitionFrameRate." +
-                            "Program will continue without limit.")
+        self.camera.set_framerate(newfps)
+        self.camera.set_exposuretime(value)
             
         # Setup acquisition timer accordingly
-        self.__acquisition_timer.setInterval((1 / fps) * 1000)
+        self.__freerun_timer.setInterval((1 / self.camera.framerate) * 1000)
+
+    def __on_freerun_timer(self):
+        """
+        This function gets called on every timeout of the freerun timer
+        """
+        try:
+            self.image = self.camera.get_image()
+            self.progress.emit()
+        except ids_peak.Exception as e:
+            self.__freerun_error_counter += 1
+            logging.error("Could not get image: " + str(e))
+
+    def __del__(self):
+        self.camera.destroy_all()
 
 class MotorThread(QObject):
     """Qt thread handling the motor control (including joystick handling) independently from the UI"""
@@ -455,10 +290,6 @@ class MotorThread(QObject):
     @Slot()
     def move_to_point(self,relative=True,stepunit=True):
         """ Moves the stage to a relative or absolute coordinate specified in either step or real units"""
-
-        test = QTimer(self)
-        test.setTimerType(QtCore.Qt.PreciseTimer)
-        test.timeout.connect(print("test"))
         
         if relative is False:
             self.__stage.go_to_point(xdistance=self.target_xmove,
@@ -529,9 +360,13 @@ class MotorThread(QObject):
             self.__joystick_enabled = True
             
 class MicroscopeApp(uiclass, baseclass):
+    # Motor signals
     move_command_signal = Signal(bool,bool)
     motorspeed_change_signal = Signal(str)
     button_move_command = Signal(str)
+    # Camera signals
+    camera_start_signal = Signal()
+    camera_stop_signal = Signal()
     set_exposure_signal = Signal(int)
 
     def __init__(self):
@@ -552,7 +387,6 @@ class MicroscopeApp(uiclass, baseclass):
         # Create the STAGE CONTROLLER worker thread
         self.motor_worker = MotorThread(port="COM10", address_x="1", address_y="0")
         self.motor_thread = QThread()
-        # self.motor_worker.pos_updated.connect(self.position_label_update)
         self.motor_worker.moveToThread(self.motor_thread)
         self.motor_thread.start()
 
@@ -611,7 +445,9 @@ class MicroscopeApp(uiclass, baseclass):
         self.exposure_slider.valueChanged.connect(self.set_exposure)
         self.set_exposure_signal.connect(self.camera_worker.on_exposure_change)
         self.gain_slider.valueChanged.connect(self.set_gain)
-        self.camera_start_button.clicked.connect(self.start_camera)
+        self.camera_start_button.clicked.connect(self.start_stop_camera)
+        self.camera_start_signal.connect(self.camera_worker.start_freerun)
+        self.camera_stop_signal.connect(self.camera_worker.stop_freerun)
 
         # IMAGE DISPLAY AREA SETUP
         init_image = np.ones((2076,3088,4), dtype="uint8")
@@ -629,27 +465,15 @@ class MicroscopeApp(uiclass, baseclass):
         self.crosshair_hLine = pg.InfiniteLine(angle=0, movable=False)
         self.image_view_area.addItem(self.crosshair_vLine, ignoreBounds=True)
         self.image_view_area.addItem(self.crosshair_hLine, ignoreBounds=True)
-
-        tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
-        tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
-        tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
-        self.imItem.setTransform(tr)
         self.image_view_area.getAxis('bottom').setLabel('X position / μm')
         self.image_view_area.getAxis('left').setLabel('Y position / μm')
         self.image_view_area.showAxes(True)
         self.image_view_area.setAspectLocked(True)
 
-        # STATUSBAR CUSTOMIZATION
-        status_bar_layout = QtWidgets.QHBoxLayout()
-        status_bar_layout.setContentsMargins(0, 0, 0, 0)
-        self.general_status_label = QtWidgets.QLabel(self.statusbar)
-        self.general_status_label.setAlignment(QtCore.Qt.AlignLeft)
-        status_bar_layout.addWidget(self.general_status_label)
-        status_bar_layout.addStretch()
-        self.camera_status_label = QtWidgets.QLabel(self.statusbar)
-        self.camera_status_label.setAlignment(QtCore.Qt.AlignRight)
-        status_bar_layout.addWidget(self.camera_status_label)
-        self.statusbar.setLayout(status_bar_layout)
+        tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
+        tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
+        tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
+        self.imItem.setTransform(tr)
 
     def position_label_update(self):
         """ Gets the position from the motor thread and updates the labels"""
@@ -758,12 +582,15 @@ class MicroscopeApp(uiclass, baseclass):
             pass
 
 # CAMERA RELATED FUNCTIONS
-    def start_camera(self):
-        pass
+    def start_stop_camera(self):
+        if self.camera_start_button.isChecked():
+            self.camera_start_signal.emit()
+        else:
+            self.camera_stop_signal.emit()
 
     def update_image(self):
-        self.imItem.setImage(image=self.camera_worker.image, autoLevels=False, levels=None, lut=False, autoDownsample=False)
-        # self.image_view_area.setImage(self.camera_worker.image)
+        logging.info("Do I run?")
+        self.imItem.setImage(image=self.camera_worker.camera.image, autoLevels=False, levels=None, lut=False, autoDownsample=False)
 
     def set_exposure(self):
         value = self.exposure_slider.value()
