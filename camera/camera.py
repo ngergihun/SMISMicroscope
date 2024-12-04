@@ -6,6 +6,8 @@ import numpy as np
 import copy
 
 import logging
+logger = logging.getLogger()
+logger.setLevel(logging.ERROR)
 
 class BaseCamera:
     def __init__(self) -> None:
@@ -23,7 +25,7 @@ class BaseCamera:
     def stop_acquisition(self):
         raise NotImplementedError
     
-    def set_fps(self):
+    def set_framerate(self):
         raise NotImplementedError
 
 
@@ -31,7 +33,7 @@ class IDS_Camera(BaseCamera):
     def __init__(self) -> None:
         super().__init__()
 
-        self.__device = None
+        self.device = None
         self.__nodemap_remote_device = None
         self.__datastream = None
 
@@ -43,7 +45,9 @@ class IDS_Camera(BaseCamera):
 
         self.name = None
         self.pixelformat = ids_peak_ipl.PixelFormatName_RGBa8
-        self.fps_limit = 50
+        self.max_framerate = 50
+        self.framerate = self.max_framerate
+        self.exposure_time = None
 
     def open_device(self):
         try:
@@ -57,24 +61,46 @@ class IDS_Camera(BaseCamera):
             # Open the first openable device in the managers device list
             for device in device_manager.Devices():
                 if device.IsOpenable():
-                    self.__device = device.OpenDevice(ids_peak.DeviceAccessType_Control)
+                    self.device = device.OpenDevice(ids_peak.DeviceAccessType_Control)
                     break
-            self.name = self.__device.DisplayName()
+            self.name = self.device.DisplayName()
             # Return if no device could be opened
-            if self.__device is None:
+            if self.device is None:
                 logging.critical("Device could not be opened!")
                 return False
             
             # Open standard data stream
-            datastreams = self.__device.DataStreams()
+            datastreams = self.device.DataStreams()
             if datastreams.empty():
                 logging.critical("Device has no DataStream!")
-                self.__device = None
+                self.device = None
                 return False
             self.__datastream = datastreams[0].OpenDataStream()
 
             # Get nodemap of the remote device for all accesses to the genicam nodemap tree
-            self.__nodemap_remote_device = self.__device.RemoteDevice().NodeMaps()[0]
+            self.__nodemap_remote_device = self.device.RemoteDevice().NodeMaps()[0]
+
+            try:
+                self.__nodemap_remote_device.FindNode("UserSetSelector").SetCurrentEntry("Default")
+                self.__nodemap_remote_device.FindNode("UserSetLoad").Execute()
+                self.__nodemap_remote_device.FindNode("UserSetLoad").WaitUntilDone()
+            except ids_peak.Exception:
+                # Userset is not available
+                pass
+
+            # Get the payload size for correct buffer allocation
+            payload_size = self.__nodemap_remote_device.FindNode("PayloadSize").Value()
+
+            # Get minimum number of buffers that must be announced
+            buffer_count_max = self.__datastream.NumBuffersAnnouncedMinRequired()
+
+            # Allocate and announce image buffers and queue them
+            for i in range(buffer_count_max):
+                buffer = self.__datastream.AllocAndAnnounceBuffer(payload_size)
+                self.__datastream.QueueBuffer(buffer)
+
+            # NOTE: Put here all the parameter initialization
+            self.get_limits()
 
             return True
         
@@ -88,7 +114,7 @@ class IDS_Camera(BaseCamera):
         Stop acquisition if still running and close datastream and nodemap of the device
         """
         # Stop Acquisition in case it is still running
-        self.__stop_acquisition()
+        self.stop_acquisition()
 
         # If a datastream has been opened, try to revoke its image buffers
         if self.__datastream is not None:
@@ -101,9 +127,11 @@ class IDS_Camera(BaseCamera):
     def start_acquisition(self):
         """Start Acquisition on camera to receive images."""
         # Check that a device is opened and that the acquisition is NOT running. If not, return.
-        if self.__device is None:
+        if self.device is None:
             return False
+        
         if self.__acquisition_running is True:
+            logging.DEBUG("Cannot start acquisition while it is already running!")
             return True
 
         try:
@@ -124,25 +152,27 @@ class IDS_Camera(BaseCamera):
             self.__nodemap_remote_device.FindNode("AcquisitionStart").Execute()
             self.__nodemap_remote_device.FindNode("AcquisitionStart").WaitUntilDone()
 
+            self.__acquisition_running = True
+            logging.debug("Acquisition started")
+            return True
+
         except Exception as e:
             logging.error("Exception: " + str(e))
             return False
-
-        self.__acquisition_running = True
-
-        return True
     
     def stop_acquisition(self):
         """Stop acquisition timer and stop acquisition on camera"""
 
         # Check that a device is opened and that the acquisition is running. If not, return.
-        if self.__device is None or self.__acquisition_running is False:
+        if self.device is None or self.__acquisition_running is False:
             return
 
+        logging.debug("ACQUISITION STOP")
         # Otherwise try to stop acquisition
         try:
-            remote_nodemap = self.__device.RemoteDevice().NodeMaps()[0]
-            remote_nodemap.FindNode("AcquisitionStop").Execute()
+            # remote_nodemap = self.device.RemoteDevice().NodeMaps()[0]
+            # remote_nodemap.FindNode("AcquisitionStop").Execute()
+            self.__nodemap_remote_device.FindNode("AcquisitionStop").Execute()
 
             # Stop and flush datastream
             self.__datastream.KillWait()
@@ -156,25 +186,27 @@ class IDS_Camera(BaseCamera):
                 try:
                     self.__nodemap_remote_device.FindNode("TLParamsLocked").SetValue(0)
                 except Exception as e:
-                    logging.info("Exception" + str(e))
+                    logging.critical("Exception" + str(e))
 
         except Exception as e:
-            logging.info("Exception" + str(e))
+            logging.critical("Exception" + str(e))
 
-    def set_fps(self,fps):
+    def set_framerate(self,fps):
         # Get the maximum framerate possible, limit it to the configured fps_limit. If the limit can't be reached, set
         # acquisition interval to the maximum possible framerate
         try:
-            max_fps = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
-            target_fps = min(max_fps, fps)
+            self.max_framerate = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
+            target_fps = min(self.max_framerate, fps)
             self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").SetValue(target_fps)
         except ids_peak.Exception:
             # AcquisitionFrameRate is not available. Unable to limit fps. Print warning and continue on.
             logging.warning("Warning: Unable to limit fps, since the AcquisitionFrameRate." +
                             "Program will continue without limit.")
+        self.framerate = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Value()
+        return self.framerate
 
     def set_singleshot(self):
-        if self.__acquisition_running:
+        if self.__acquisition_running is True:
             self.stop_acquisition()
         
         self.__nodemap_remote_device.FindNode("AcquisitionMode").SetCurrentEntry("SingleFrame")
@@ -184,15 +216,13 @@ class IDS_Camera(BaseCamera):
 
         # Get the payload size for correct buffer allocation
         payload_size = self.__nodemap_remote_device.FindNode("PayloadSize").Value()
-        print(payload_size)
         buffer_count_max = self.__datastream.NumBuffersAnnouncedMinRequired()
-        print(buffer_count_max)
         for i in range(buffer_count_max):
             buffer = self.__datastream.AllocAndAnnounceBuffer(payload_size)
             self.__datastream.QueueBuffer(buffer)
 
         self.start_acquisition()
-        self.__nodemap_remote_device.FindNode("TriggerSoftware").Execute()
+        # self.__nodemap_remote_device.FindNode("TriggerSoftware").Execute()
 
         try:
             self.capture_image()
@@ -202,33 +232,36 @@ class IDS_Camera(BaseCamera):
     def set_continuous(self):
         if self.__acquisition_running:
             self.stop_acquisition()
-
-        self.__nodemap_remote_device.FindNode("AcquisitionMode").SetCurrentEntry("Continuous")
-        self.__nodemap_remote_device.FindNode("TriggerSelector").SetCurrentEntry("ExposureStart")
-        self.__nodemap_remote_device.FindNode("TriggerMode").SetCurrentEntry("Off")
-
-        expvalue = self.__nodemap_remote_device.FindNode("ExposureTime").Value()
-        print(expvalue)
-        newfps = round(1000000/expvalue,1)
-        self.set_fps(newfps)
-
-        # Get the payload size for correct buffer allocation
-        payload_size = self.__nodemap_remote_device.FindNode("PayloadSize").Value()
-        print(payload_size)
-        buffer_count_max = self.__datastream.NumBuffersAnnouncedMinRequired()
-        print(buffer_count_max)
-        for i in range(buffer_count_max):
-            buffer = self.__datastream.AllocAndAnnounceBuffer(payload_size)
-            self.__datastream.QueueBuffer(buffer)
-        # start acquisition again
-        self.start_acquisition()
-        self.__nodemap_remote_device.FindNode("AcquisitionStart").Execute()
-        self.__nodemap_remote_device.FindNode("AcquisitionStart").WaitUntilDone()
-
         try:
-            self.get_image()
+            self.__nodemap_remote_device.FindNode("AcquisitionMode").SetCurrentEntry("Continuous")
+            self.__nodemap_remote_device.FindNode("TriggerSelector").SetCurrentEntry("ExposureStart")
+            self.__nodemap_remote_device.FindNode("TriggerMode").SetCurrentEntry("Off")
+
+            self.exposure_time = self.__nodemap_remote_device.FindNode("ExposureTime").Value()
+            fps = round(1000000/self.exposure_time,1)
+            self.set_framerate(fps)
+
+            # Get the payload size for correct buffer allocation
+            payload_size = self.__nodemap_remote_device.FindNode("PayloadSize").Value()
+            buffer_count_max = self.__datastream.NumBuffersAnnouncedMinRequired()
+            for i in range(buffer_count_max):
+                buffer = self.__datastream.AllocAndAnnounceBuffer(payload_size)
+                self.__datastream.QueueBuffer(buffer)
+
+            # start acquisition again
+            self.start_acquisition()
+            self.__nodemap_remote_device.FindNode("AcquisitionStart").Execute()
+            self.__nodemap_remote_device.FindNode("AcquisitionStart").WaitUntilDone()
+            # self.__nodemap_remote_device.FindNode("TriggerSoftware").Execute()
+            try:
+                self.get_image()
+            except:
+                pass
+            return True
+        
         except:
-            pass
+            logging.error("Continous acquisition could not be started!")
+            return False
     
     def set_exposuretime(self, value):
         """ Sets the exposuretime in microseconds for timed exposure mode"""
@@ -261,10 +294,11 @@ class IDS_Camera(BaseCamera):
 
             return self.image
 
-        except ids_peak.Exception as e:
-            logging.error("Exception: " + str(e))
+        except:
+            self.image = None
 
     def capture_image(self):
+
         self.__nodemap_remote_device.FindNode("AcquisitionStart").Execute()
         self.__nodemap_remote_device.FindNode("AcquisitionStart").WaitUntilDone()
         self.__nodemap_remote_device.FindNode("TriggerSoftware").Execute()
