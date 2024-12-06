@@ -6,9 +6,16 @@ components:
   - stage #first list item
   - camera #second list item
 stage:
+  port: COM10
   type: linear
   axes: 2
-  javascript: Beginner
+objectives:
+  Olympus4X:
+     pixel_to_distance: 0.5
+  Olympus10X:
+    pixel_to_distance: 0.24
+  Olympus20X:
+    pixel_to_distance: 0.12
 camera: 
   - brand: IDS 
   - fruits: 

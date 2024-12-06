@@ -12,6 +12,7 @@ import numpy as np
 from enum import Enum
 from time import sleep
 import logging
+import yaml
 
 # GUI modules
 from PySide6 import QtWidgets, QtGui
@@ -22,7 +23,7 @@ pg.setConfigOption('useNumba', True)
 pg.setConfigOption('imageAxisOrder', 'row-major')
 
 # Logging config
-logging.basicConfig(format="%(message)s", level=logging.INFO)
+logging.basicConfig(level=logging.INFO)
 
 # Stepper controller package
 import serialStepper
@@ -64,31 +65,21 @@ class CameraThread(QObject):
     def __init__(self):
         super().__init__()
 
-        # try:
-        self.camera = IDS_Camera()
-        # except:
-            # self.camera = None
+        try:
+            self.camera = IDS_Camera()
+        except:
+            self.camera = None
 
         if self.camera.open_device():
             logging.info(f"Camera: {self.camera.name}")
-            # try:
-            #     # Create a display for the camera image
-            #     if not self.camera.start_camera():
-            #        logging.critical("Unable to start acquisition!")
-            # except Exception as e:
-            #     logging.critical("Exception" + str(e))
         else:
             self.camera.destroy_all()
+            logging.critical("Could not connect to camera")
 
         # Timers
-        self.__freerun_timer = QTimer(self)
-        self.__freerun_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        # self.__freerun_timer.setSingleShot(False)
-        self.__freerun_timer.timeout.connect(self.__on_freerun_timer)
-
+        self.__init_timers()
         # Flags set by the UI thread
         self.__freerun_enabled = False
-
         # Other
         self.__freerun_error_counter = 0
 
@@ -136,6 +127,12 @@ class CameraThread(QObject):
             
         # Setup acquisition timer accordingly
         self.__freerun_timer.setInterval((1 / self.camera.framerate) * 1000)
+
+    def __init_timers(self):
+
+        self.__freerun_timer = QTimer(self)
+        self.__freerun_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.__freerun_timer.timeout.connect(self.__on_freerun_timer)
 
     def __on_freerun_timer(self):
         """
@@ -251,14 +248,15 @@ class MotorThread(QObject):
     def __read_joystick(self):
         if self.__joystick_enabled:
             state = pyspacemouse.read()
-            if self.x_enabled:
-                self.__stage.xmotor.set_targetvelocity(speed=int(state.x*2047))
+            if state is not None:
+                if self.x_enabled:
+                    self.__stage.xmotor.set_targetvelocity(speed=int(state.x*2047))
 
-            if self.y_enabled:
-                self.__stage.ymotor.set_targetvelocity(speed=int(state.y*2047))
+                if self.y_enabled:
+                    self.__stage.ymotor.set_targetvelocity(speed=int(state.y*2047))
 
-            if self.z_enabled:
-                pass
+                if self.z_enabled:
+                    pass
 
     def __activate_pointmove(self):
         self.__timer_joystick.stop()
@@ -278,19 +276,19 @@ class MotorThread(QObject):
             self.on_speed_selection_changed(self.speed_range)
         except:
             self.__success_mouse_open = None
-            QtWidgets.QMessageBox.warning(self, "Warning","Could not open 3D mouse!")
+            logging.warning("Warning Could not open 3D mouse!")
         if self.__success_mouse_open is not None:
             # Set the motors to velocity mode
             for motor in [self.__stage.xmotor, self.__stage.ymotor]:
                 motor.set_mode(move_modes.velocity)
             logging.info("Set Velocity mode")
         else:
-            QtWidgets.QMessageBox.warning(self, "Warning","Could access 3D mouse!")
+            logging.error("Warning: Could access 3D mouse!")
 
     @Slot()
     def move_to_point(self,relative=True,stepunit=True):
         """ Moves the stage to a relative or absolute coordinate specified in either step or real units"""
-        
+
         if relative is False:
             self.__stage.go_to_point(xdistance=self.target_xmove,
                                    ydistance=self.target_ymove,
@@ -301,6 +299,17 @@ class MotorThread(QObject):
                             step_units=stepunit)
         else:
             logging.info("Movement definition is not clear!")
+
+        self.__read_position()
+        # moving_timer = QTimer()
+        # moving_timer.setSingleShot(True)
+        # moving_timer.timeout.connect(self.__read_position)
+
+        # self.__read_position()
+        # while self.moving:
+        #     moving_timer.start(10)
+        #     # pass
+        # print("Arrived")
         
     @Slot()
     def reset_position(self):
@@ -364,6 +373,7 @@ class MicroscopeApp(uiclass, baseclass):
     move_command_signal = Signal(bool,bool)
     motorspeed_change_signal = Signal(str)
     button_move_command = Signal(str)
+
     # Camera signals
     camera_start_signal = Signal()
     camera_stop_signal = Signal()
@@ -372,10 +382,12 @@ class MicroscopeApp(uiclass, baseclass):
     def __init__(self):
         super().__init__()
 
-        # Initialize the user interface from the generated module
+    # Initialize the user interface from the generated module
         self.setupUi(self)
+        self.load_config()
+        self.objective_combo.addItems(self.config["objectives"].keys())
 
-        # Create the CAMERA worker thread
+    # Create the CAMERA worker thread
         self.camera_worker = CameraThread()
         self.camera_thread = QThread()
         self.camera_worker.progress.connect(self.update_image)
@@ -383,16 +395,25 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_thread.start()
 
         self.microns_per_pixel = 0.24
+        self.steps_per_pixel = None
 
-        # Create the STAGE CONTROLLER worker thread
-        self.motor_worker = MotorThread(port="COM10", address_x="1", address_y="0")
+    # Create the STAGE CONTROLLER worker thread
+        port = self.config['stage']['port']
+        self.motor_worker = MotorThread(port=port, address_x="1", address_y="0")
         self.motor_thread = QThread()
         self.motor_worker.moveToThread(self.motor_thread)
         self.motor_thread.start()
 
-        # SIGNAL connects to MOTOR related command signals and buttons
+    # SIGNAL connects to MOTOR related command signals and buttons
         self.click_move_enabled = False
         self.click_move_button.clicked.connect(self.click_move_enable)
+        self.moving = False
+
+    # Timer to locally monitor the movement
+        self.moving_timer = QTimer()
+        self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.moving_timer.timeout.connect(self.get_movement)
+
         if self.motor_worker.is_stage_available:
             # Position update
             self.motor_worker.pos_updated.connect(self.position_label_update)
@@ -428,6 +449,8 @@ class MicroscopeApp(uiclass, baseclass):
             self.x_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             self.y_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             self.z_lock_switch.stateChanged.connect(self.on_axis_lock_change)
+            # calibrate
+            self.calibrate_button.clicked.connect(self.start_calibrate_pixels)
 
             # UI state initial setups
             if (self.motor_worker.xthreadpitch == None or self.motor_worker.ythreadpitch == None):
@@ -441,7 +464,7 @@ class MicroscopeApp(uiclass, baseclass):
 
             self.control_tab.currentChanged.emit(self.control_tab.currentIndex())
 
-        # CAMERA CONTROL UI INTEMS
+    # CAMERA CONTROL UI ITEMS
         self.exposure_slider.valueChanged.connect(self.set_exposure)
         self.set_exposure_signal.connect(self.camera_worker.on_exposure_change)
         self.gain_slider.valueChanged.connect(self.set_gain)
@@ -449,18 +472,26 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_start_signal.connect(self.camera_worker.start_freerun)
         self.camera_stop_signal.connect(self.camera_worker.stop_freerun)
 
-        # IMAGE DISPLAY AREA SETUP
-        init_image = np.ones((2076,3088,4), dtype="uint8")
+    # IMAGE DISPLAY AREA SETUP
+        self.customize_display()
+        init_image = np.zeros((2076,3088,4), dtype="uint8")
         self.imItem = pg.ImageItem(init_image, autoLevels=False)             # create an ImageItem
         self.image_view_area.addItem(self.imItem)                                                   # add it to the PlotWidget
+        self.imItem.hoverEvent = self.imageHoverEvent
+        self.imItem.mouseClickEvent = self.imageClickEvent
+        
+        tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
+        tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
+        tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
+        self.imItem.setTransform(tr)
+
+# IMAGE DISPLAY CUSTOMIZATION
+    def customize_display(self):
         self.image_view_area.setBackground('w')
         self.image_view_area.setAspectLocked(True)
         self.image_view_area.invertY(True)
         self.image_view_area.getAxis('left').setTextPen('black')
         self.image_view_area.getAxis('bottom').setTextPen('black')
-        self.image_view_area.setMouseTracking(True)                                                 # For cursor tracking
-        self.imItem.hoverEvent = self.imageHoverEvent                                               # Attach event
-        self.imItem.mouseClickEvent = self.imageClickEvent                                          # Attach event
         self.crosshair_vLine = pg.InfiniteLine(angle=90, movable=False)
         self.crosshair_hLine = pg.InfiniteLine(angle=0, movable=False)
         self.image_view_area.addItem(self.crosshair_vLine, ignoreBounds=True)
@@ -469,12 +500,9 @@ class MicroscopeApp(uiclass, baseclass):
         self.image_view_area.getAxis('left').setLabel('Y position / μm')
         self.image_view_area.showAxes(True)
         self.image_view_area.setAspectLocked(True)
+        self.image_view_area.setMouseTracking(True)
 
-        tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
-        tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
-        tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
-        self.imItem.setTransform(tr)
-
+# MOTOR RELATED FUNCTIONS
     def position_label_update(self):
         """ Gets the position from the motor thread and updates the labels"""
         if self.motor_worker.unit == units.steps:
@@ -509,6 +537,7 @@ class MicroscopeApp(uiclass, baseclass):
 
     def speed_selection_changed(self, button):
         if button.isChecked():
+            self.speed_range = button.text()
             self.motorspeed_change_signal.emit(button.text())
 
     def movebutton_on_release(self, button):
@@ -525,24 +554,31 @@ class MicroscopeApp(uiclass, baseclass):
         self.motor_worker.z_enabled = self.z_lock_switch.isChecked()
 
     def imageClickEvent(self, event):
+        # Get mouse position
+        pos = event.pos()
+        ppos = self.imItem.mapToParent(pos)
+        self.click_x, self.click_y = ppos.x(), ppos.y()
+
         if self.click_move_enabled:
-            # Get mouse position
-            pos = event.pos()
-            ppos = self.imItem.mapToParent(pos)
-            x, y = ppos.x(), ppos.y()
-            
-            # Go to position
-            # xpix_move = 3088/2-x
-            # self.motor_worker.target_xmove = self.pixel_to_distance(xpix_move)
-            # ypix_move = y-2076/2
-            # self.motor_worker.target_ymove = self.pixel_to_distance(ypix_move)
+            self.click_move()
 
-            self.motor_worker.target_xmove = -x
-            self.motor_worker.target_ymove = y
+        if self.click_calibrate:
+            self.calibrate_by_click()
 
-            logging.info(f"X pixel coordinate: {x}, Y pixel coordinate {y}")
-            # self.motor_worker.move_to_point(True,False)
-            self.move_command_signal.emit(False,False)
+    def click_move(self):
+
+        self.motor_worker.target_xmove = -self.click_x
+        self.motor_worker.target_ymove = self.click_y
+        
+        logging.info(f"X pixel coordinate: {self.click_x}, Y pixel coordinate {self.click_y}")
+        
+        self.motorspeed_change_signal.emit(self.speed_range)
+        self.move_command_signal.emit(False,False)
+
+
+    def get_movement(self):
+        self.moving = self.motor_worker.moving
+        return self.moving
 
     def imageHoverEvent(self,event):
         # Show the position, pixel, and value under the mouse cursor.
@@ -565,6 +601,7 @@ class MicroscopeApp(uiclass, baseclass):
         else:
             self.click_move_enabled = False
 
+# MOTOR AND CAMERA RELATED FUNCTIONS
     def update_image_scales(self):
         tr = self.imItem.transform()
 
@@ -580,6 +617,42 @@ class MicroscopeApp(uiclass, baseclass):
             self.crosshair_hLine.setPos(self.motor_worker.ypos)
         elif self.motor_worker.unit == units.steps:
             pass
+
+    def start_calibrate_pixels(self):
+        button = QtWidgets.QMessageBox.question(self,"Question dialog","Do you want to proceed?")
+        if button == QtWidgets.QMessageBox.Yes:
+            pass
+        else:
+            return
+        # Grab an image
+        # if self.self.camera_start_button.isChecked():
+        #     image1 = self.camera_worker.camera.image
+        # Move 1000 steps
+        self.motor_worker.target_xmove = 2000
+        self.motor_worker.target_ymove = 2000
+        self.motor_worker.target_zmove = 0
+
+        self.move_command_signal.emit(True,True)
+
+        sleep(0.1)
+        self.moving_timer.timeout.connect(self.end_calibrate_pixels)
+        self.moving_timer.start(200)
+
+        # Grab another image when arrived
+        # image2 = self.camera_worker.camera.image
+        # Calculate shift
+        #calculate steps per pixel
+        #   self.steps_per_pixel = shift/1000
+        # self.dist_per_pixel = linear.steps_to_distance(steps=self.steps_per_pixel,
+                                                    #    threadpitch=self.motor_worker.xthreadpitch,
+                                                    #    steps_per_rev=self.motor_worker.__stage.xmotor.steps_per_rev)
+        
+    def end_calibrate_pixels(self):
+        if self.get_movement():
+            return
+        else:
+            self.moving_timer.stop()
+            print("Arrive")
 
 # CAMERA RELATED FUNCTIONS
     def start_stop_camera(self):
@@ -607,6 +680,11 @@ class MicroscopeApp(uiclass, baseclass):
 
     def pixel_to_distance(self, pixels):
         return self.microns_per_pixel*pixels
+
+# OTHER FUNCTIONS
+    def load_config(self):
+        with open('config.yaml', 'r') as file:
+                self.config = yaml.safe_load(file)
 
     def closeEvent(self, event):
         quit_msg = "Are you sure you want to exit the program?"

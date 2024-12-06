@@ -6,8 +6,8 @@ import numpy as np
 import copy
 
 import logging
-logger = logging.getLogger()
-logger.setLevel(logging.ERROR)
+# logger = logging.getLogger()
+# logger.setLevel(logging.ERROR)
 
 class BaseCamera:
     def __init__(self) -> None:
@@ -49,6 +49,9 @@ class IDS_Camera(BaseCamera):
         self.framerate = self.max_framerate
         self.exposure_time = None
 
+        self.image_width = None
+        self.image_height = None
+
     def open_device(self):
         try:
             # Create instance of the device manager
@@ -56,7 +59,7 @@ class IDS_Camera(BaseCamera):
             device_manager.Update()
             # Return if no device was found
             if device_manager.Devices().empty():
-                logging.critical("Error", "No device found!")
+                logging.critical("Error: No IDS camera device found!")
                 return False
             # Open the first openable device in the managers device list
             for device in device_manager.Devices():
@@ -66,7 +69,7 @@ class IDS_Camera(BaseCamera):
             self.name = self.device.DisplayName()
             # Return if no device could be opened
             if self.device is None:
-                logging.critical("Device could not be opened!")
+                logging.critical("IDS camera device could not be opened!")
                 return False
             
             # Open standard data stream
