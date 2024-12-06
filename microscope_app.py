@@ -618,19 +618,22 @@ class MicroscopeApp(uiclass, baseclass):
         elif self.motor_worker.unit == units.steps:
             pass
 
-    def start_calibrate_pixels(self):
+    def calibrate_pixels(self,xsteps,ysteps):
+        pass
+
+    def start_calibrate_pixels(self,xsteps,ysteps):
         button = QtWidgets.QMessageBox.question(self,"Question dialog","Do you want to proceed?")
         if button == QtWidgets.QMessageBox.Yes:
             pass
         else:
             return
         # Grab an image
-        # if self.self.camera_start_button.isChecked():
-        #     image1 = self.camera_worker.camera.image
+        if self.self.camera_start_button.isChecked():
+            image1 = self.camera_worker.camera.image
         # Move 1000 steps
-        self.motor_worker.target_xmove = 2000
-        self.motor_worker.target_ymove = 2000
-        self.motor_worker.target_zmove = 0
+        sleep(0.1)
+        self.motor_worker.target_xmove = xsteps
+        self.motor_worker.target_ymove = ysteps
 
         self.move_command_signal.emit(True,True)
 
