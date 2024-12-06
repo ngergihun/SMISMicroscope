@@ -46,6 +46,7 @@ from ids_peak_ipl import ids_peak_ipl
 from ids_peak import ids_peak_ipl_extension
 
 from camera.camera import IDS_Camera
+from skimage.registration import phase_cross_correlation
 
 FPS_LIMIT = 50
 TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
@@ -450,7 +451,7 @@ class MicroscopeApp(uiclass, baseclass):
             self.y_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             self.z_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             # calibrate
-            self.calibrate_button.clicked.connect(self.start_calibrate_pixels)
+            self.calibrate_button.clicked.connect(self.calibrate_pixels)
 
             # UI state initial setups
             if (self.motor_worker.xthreadpitch == None or self.motor_worker.ythreadpitch == None):
@@ -577,9 +578,8 @@ class MicroscopeApp(uiclass, baseclass):
 
 
     def get_movement(self):
-        self.moving = self.motor_worker.moving
-        return self.moving
-
+        return self.motor_worker.moving
+        
     def imageHoverEvent(self,event):
         # Show the position, pixel, and value under the mouse cursor.
         if event.isExit():
@@ -618,9 +618,9 @@ class MicroscopeApp(uiclass, baseclass):
         elif self.motor_worker.unit == units.steps:
             pass
 
-    def calibrate_pixels(self,xsteps,ysteps):
-        pass
-
+    def calibrate_pixels(self):
+        self.start_calibrate_pixels(xsteps=-2000,ysteps=-2000)
+        
     def start_calibrate_pixels(self,xsteps,ysteps):
         button = QtWidgets.QMessageBox.question(self,"Question dialog","Do you want to proceed?")
         if button == QtWidgets.QMessageBox.Yes:
@@ -628,34 +628,34 @@ class MicroscopeApp(uiclass, baseclass):
         else:
             return
         # Grab an image
-        if self.self.camera_start_button.isChecked():
-            image1 = self.camera_worker.camera.image
-        # Move 1000 steps
+        if self.camera_start_button.isChecked():
+            self.image1 = self.camera_worker.camera.image
+        # Move
         sleep(0.1)
         self.motor_worker.target_xmove = xsteps
         self.motor_worker.target_ymove = ysteps
-
         self.move_command_signal.emit(True,True)
 
         sleep(0.1)
-        self.moving_timer.timeout.connect(self.end_calibrate_pixels)
+        self.moving_timer.timeout.connect(lambda: self.end_calibrate_pixels(xsteps=xsteps,ysteps=ysteps))
         self.moving_timer.start(200)
 
-        # Grab another image when arrived
-        # image2 = self.camera_worker.camera.image
-        # Calculate shift
-        #calculate steps per pixel
-        #   self.steps_per_pixel = shift/1000
-        # self.dist_per_pixel = linear.steps_to_distance(steps=self.steps_per_pixel,
-                                                    #    threadpitch=self.motor_worker.xthreadpitch,
-                                                    #    steps_per_rev=self.motor_worker.__stage.xmotor.steps_per_rev)
-        
-    def end_calibrate_pixels(self):
+    def end_calibrate_pixels(self,xsteps=2000,ysteps=2000):
         if self.get_movement():
             return
         else:
             self.moving_timer.stop()
-            print("Arrive")
+            print(f"Arrived after: x={xsteps} steps, y={ysteps} steps")
+            # Grab another image when arrived
+            self.image2 = self.camera_worker.camera.image
+            # Calculate shift
+
+            shift, _, _ = phase_cross_correlation(self.image1, self.image2)
+            print(shift)
+            # self.steps_per_pixel = shift/1000
+            # self.dist_per_pixel = linear.steps_to_distance(steps=self.steps_per_pixel,
+                                                    #    threadpitch=self.motor_worker.xthreadpitch,
+                                                    #    steps_per_rev=self.motor_worker.__stage.xmotor.steps_per_rev)
 
 # CAMERA RELATED FUNCTIONS
     def start_stop_camera(self):
@@ -665,7 +665,7 @@ class MicroscopeApp(uiclass, baseclass):
             self.camera_stop_signal.emit()
 
     def update_image(self):
-        logging.info("Do I run?")
+        # logging.info("Do I run?")
         self.imItem.setImage(image=self.camera_worker.camera.image, autoLevels=False, levels=None, lut=False, autoDownsample=False)
 
     def set_exposure(self):
