@@ -21,6 +21,7 @@ from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer
 import pyqtgraph as pg
 pg.setConfigOption('useNumba', True)
 pg.setConfigOption('imageAxisOrder', 'row-major')
+from qt_material import apply_stylesheet
 
 # Logging config
 logging.basicConfig(level=logging.INFO)
@@ -47,6 +48,7 @@ from ids_peak import ids_peak_ipl_extension
 
 from camera.camera import IDS_Camera
 from skimage.registration import phase_cross_correlation
+from skimage.color import rgb2gray, rgba2rgb
 
 FPS_LIMIT = 50
 TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
@@ -385,6 +387,14 @@ class MicroscopeApp(uiclass, baseclass):
 
     # Initialize the user interface from the generated module
         self.setupUi(self)
+        # apply_stylesheet(app, theme='dark_blue.xml', invert_secondary=True)
+    # Flags, attributes and config
+        self.microns_per_pixel = 0.22
+        self.steps_per_pixel = None
+        self.moving = False
+        self.click_move_enabled = False
+
+        self.fixed_image = None
         self.load_config()
         self.objective_combo.addItems(self.config["objectives"].keys())
 
@@ -395,9 +405,6 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_worker.moveToThread(self.camera_thread)
         self.camera_thread.start()
 
-        self.microns_per_pixel = 0.24
-        self.steps_per_pixel = None
-
     # Create the STAGE CONTROLLER worker thread
         port = self.config['stage']['port']
         self.motor_worker = MotorThread(port=port, address_x="1", address_y="0")
@@ -405,16 +412,12 @@ class MicroscopeApp(uiclass, baseclass):
         self.motor_worker.moveToThread(self.motor_thread)
         self.motor_thread.start()
 
-    # SIGNAL connects to MOTOR related command signals and buttons
-        self.click_move_enabled = False
-        self.click_move_button.clicked.connect(self.click_move_enable)
-        self.moving = False
-
     # Timer to locally monitor the movement
         self.moving_timer = QTimer()
         self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.moving_timer.timeout.connect(self.get_movement)
-
+    # SIGNAL connects to MOTOR related command signals and buttons
+        self.click_move_button.clicked.connect(self.click_move_enable)
         if self.motor_worker.is_stage_available:
             # Position update
             self.motor_worker.pos_updated.connect(self.position_label_update)
@@ -426,8 +429,8 @@ class MicroscopeApp(uiclass, baseclass):
             self.mid_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.mid_speed_radio))
             self.high_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.high_speed_radio))
             # Unit switch radiobuttons
-            self.steps_radio.toggled.connect(lambda: self.distance_unit_changed(self.steps_radio))
-            self.microns_radio.toggled.connect(lambda: self.distance_unit_changed(self.microns_radio))
+            # self.steps_radio.toggled.connect(lambda: self.distance_unit_changed(self.steps_radio))
+            # self.microns_radio.toggled.connect(lambda: self.distance_unit_changed(self.microns_radio))
             # Move and position reset buttons
             self.move_button.clicked.connect(self.move_to_buttoncall)
             self.move_command_signal.connect(self.motor_worker.move_to_point)
@@ -454,14 +457,16 @@ class MicroscopeApp(uiclass, baseclass):
             self.calibrate_button.clicked.connect(self.calibrate_pixels)
 
             # UI state initial setups
-            if (self.motor_worker.xthreadpitch == None or self.motor_worker.ythreadpitch == None):
-                self.unit = units.steps
-                self.steps_radio.setChecked(True)
-                self.motor_worker.unit = units.steps
-            else:
-                self.unit = units.microns
-                self.motor_worker.unit = units.microns
-                self.microns_radio.setChecked(True)
+            # if (self.motor_worker.xthreadpitch == None or self.motor_worker.ythreadpitch == None):
+            #     self.unit = units.steps
+            #     self.steps_radio.setChecked(True)
+            #     self.motor_worker.unit = units.steps
+            # else:
+            #     self.unit = units.microns
+            #     self.motor_worker.unit = units.microns
+            #     self.microns_radio.setChecked(True)
+            self.unit = units.microns
+            self.motor_worker.unit = units.microns
 
             self.control_tab.currentChanged.emit(self.control_tab.currentIndex())
 
@@ -472,6 +477,7 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_start_button.clicked.connect(self.start_stop_camera)
         self.camera_start_signal.connect(self.camera_worker.start_freerun)
         self.camera_stop_signal.connect(self.camera_worker.stop_freerun)
+        self.register_image_button.clicked.connect(self.register_image_to_map)
 
     # IMAGE DISPLAY AREA SETUP
         self.customize_display()
@@ -563,8 +569,8 @@ class MicroscopeApp(uiclass, baseclass):
         if self.click_move_enabled:
             self.click_move()
 
-        if self.click_calibrate:
-            self.calibrate_by_click()
+        # if self.click_calibrate:
+        #     self.calibrate_by_click()
 
     def click_move(self):
 
@@ -629,7 +635,7 @@ class MicroscopeApp(uiclass, baseclass):
             return
         # Grab an image
         if self.camera_start_button.isChecked():
-            self.image1 = self.camera_worker.camera.image
+            self.image1 = rgb2gray(rgba2rgb(self.camera_worker.camera.image))
         # Move
         sleep(0.1)
         self.motor_worker.target_xmove = xsteps
@@ -647,7 +653,7 @@ class MicroscopeApp(uiclass, baseclass):
             self.moving_timer.stop()
             print(f"Arrived after: x={xsteps} steps, y={ysteps} steps")
             # Grab another image when arrived
-            self.image2 = self.camera_worker.camera.image
+            self.image2 = rgb2gray(rgba2rgb(self.camera_worker.camera.image))
             # Calculate shift
 
             shift, _, _ = phase_cross_correlation(self.image1, self.image2)
@@ -683,6 +689,27 @@ class MicroscopeApp(uiclass, baseclass):
 
     def pixel_to_distance(self, pixels):
         return self.microns_per_pixel*pixels
+    
+    def register_image_to_map(self):
+        # Grab an image
+        if self.camera_start_button.isChecked():
+            image = self.camera_worker.camera.image
+            self.fixed_image = pg.ImageItem(image=image)
+
+            newdx = -np.shape(image)[1]/2*self.microns_per_pixel-self.motor_worker.xpos
+            newdy = -np.shape(image)[0]/2*self.microns_per_pixel+self.motor_worker.ypos
+
+            tr = QtGui.QTransform()
+            tr.translate(newdx,newdy)
+            tr.scale(self.microns_per_pixel,self.microns_per_pixel)
+            self.fixed_image.setTransform(tr)
+
+            self.image_view_area.addItem(self.fixed_image)
+
+            print(f"Size of image array: {sys.getsizeof(image)/1000000}")
+        else:
+            logging.error("Camera is not enabled, cannot grab image!")
+
 
 # OTHER FUNCTIONS
     def load_config(self):
@@ -706,6 +733,12 @@ class MicroscopeApp(uiclass, baseclass):
 
 class SingleImage():
     """Class for storing image data from the microscope"""
+    def __init__(self, image=None, xloc = 0, yloc = 0):
+
+        self.image = image
+        self.xloc = xloc
+        self.yloc = yloc
+
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
