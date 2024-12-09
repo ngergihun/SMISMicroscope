@@ -3,8 +3,8 @@
 ---
 name: Transfer Microscope #key-value
 components: 
-  - stage #first list item
-  - camera #second list item
+  - stage
+  - camera
 stage:
   port: COM10
   type: linear
@@ -13,9 +13,9 @@ objectives:
   Olympus4X:
      pixel_to_distance: 0.5
   Olympus10X:
-    pixel_to_distance: 0.24
+    pixel_to_distance: 0.22
   Olympus20X:
-    pixel_to_distance: 0.12
+    pixel_to_distance: 0.11
 camera: 
   - brand: IDS 
   - fruits: 

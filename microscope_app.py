@@ -51,8 +51,8 @@ from skimage.registration import phase_cross_correlation
 from skimage.color import rgb2gray, rgba2rgb
 
 FPS_LIMIT = 50
-TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
-# TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_BGRa8
+# TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
+TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGB8
 
 # UI import
 ui_file_name = 'microscope_app.ui'
@@ -388,15 +388,15 @@ class MicroscopeApp(uiclass, baseclass):
     # Initialize the user interface from the generated module
         self.setupUi(self)
         # apply_stylesheet(app, theme='dark_blue.xml', invert_secondary=True)
+
     # Flags, attributes and config
-        self.microns_per_pixel = 0.22
+        self.load_config()
+        self.objective_combo.addItems(self.config["objectives"].keys())
+        self.microns_per_pixel = self.config["objectives"][self.objective_combo.currentText()]["pixel_to_distance"]
         self.steps_per_pixel = None
         self.moving = False
         self.click_move_enabled = False
-
         self.fixed_image = None
-        self.load_config()
-        self.objective_combo.addItems(self.config["objectives"].keys())
 
     # Create the CAMERA worker thread
         self.camera_worker = CameraThread()
@@ -416,7 +416,9 @@ class MicroscopeApp(uiclass, baseclass):
         self.moving_timer = QTimer()
         self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.moving_timer.timeout.connect(self.get_movement)
+
     # SIGNAL connects to MOTOR related command signals and buttons
+        self.objective_combo.currentIndexChanged.connect(self.objective_change)
         self.click_move_button.clicked.connect(self.click_move_enable)
         if self.motor_worker.is_stage_available:
             # Position update
@@ -456,15 +458,6 @@ class MicroscopeApp(uiclass, baseclass):
             # calibrate
             self.calibrate_button.clicked.connect(self.calibrate_pixels)
 
-            # UI state initial setups
-            # if (self.motor_worker.xthreadpitch == None or self.motor_worker.ythreadpitch == None):
-            #     self.unit = units.steps
-            #     self.steps_radio.setChecked(True)
-            #     self.motor_worker.unit = units.steps
-            # else:
-            #     self.unit = units.microns
-            #     self.motor_worker.unit = units.microns
-            #     self.microns_radio.setChecked(True)
             self.unit = units.microns
             self.motor_worker.unit = units.microns
 
@@ -481,8 +474,7 @@ class MicroscopeApp(uiclass, baseclass):
 
     # IMAGE DISPLAY AREA SETUP
         self.customize_display()
-        init_image = np.zeros((2076,3088,4), dtype="uint8")
-        self.imItem = pg.ImageItem(init_image, autoLevels=False)             # create an ImageItem
+        self.imItem = pg.ImageItem(np.zeros((2076,3088,4), dtype="uint8"), autoLevels=False)             # create an ImageItem
         self.image_view_area.addItem(self.imItem)                                                   # add it to the PlotWidget
         self.imItem.hoverEvent = self.imageHoverEvent
         self.imItem.mouseClickEvent = self.imageClickEvent
@@ -582,7 +574,6 @@ class MicroscopeApp(uiclass, baseclass):
         self.motorspeed_change_signal.emit(self.speed_range)
         self.move_command_signal.emit(False,False)
 
-
     def get_movement(self):
         return self.motor_worker.moving
         
@@ -662,6 +653,9 @@ class MicroscopeApp(uiclass, baseclass):
             # self.dist_per_pixel = linear.steps_to_distance(steps=self.steps_per_pixel,
                                                     #    threadpitch=self.motor_worker.xthreadpitch,
                                                     #    steps_per_rev=self.motor_worker.__stage.xmotor.steps_per_rev)
+
+    def objective_change(self):
+        self.microns_per_pixel = self.config["objectives"][self.objective_combo.currentText()]["pixel_to_distance"]
 
 # CAMERA RELATED FUNCTIONS
     def start_stop_camera(self):
