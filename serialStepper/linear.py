@@ -1,4 +1,4 @@
-"""Module for linear stages. Inherits from elliptec.Motor."""
+"""Module for linear stages. """
 from . import CustomMotor
 
 

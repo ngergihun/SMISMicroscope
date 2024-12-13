@@ -1,25 +1,31 @@
-#Comment: 
-#Describes some characteristics and preferences
----
-name: Transfer Microscope #key-value
-components: 
-  - stage
-  - camera
-stage:
-  port: COM10
-  type: linear
-  axes: 2
+camera:
+- brand: IDS
+components:
+- stage
+- camera
+name: Transfer Microscope
 objectives:
-  Olympus4X:
-     pixel_to_distance: 0.5
   Olympus10X:
-    pixel_to_distance: 0.22
+    magnification: 10
+    pixel_to_distance: 0.21709771348256957
   Olympus20X:
-    pixel_to_distance: 0.11
-camera: 
-  - brand: IDS 
-  - fruits: 
-      citrics: oranges 
-      tropical: bananas
-      nuts: peanuts
-      sweets: raisins
+    magnification: 20
+    pixel_to_distance: 0.10836853687246352
+  Olympus4X:
+    magnification: 4
+    pixel_to_distance: 0.5470330825081491
+  Nachet20X-LWD:
+    magnification: 20
+    pixel_to_distance: 0.1217194985701941
+  OlympusSLMPlan50X-LWD:
+    magnification: 50
+    pixel_to_distance: 0.04397579262355738
+stage:
+  axes:
+    x-axis:
+      orientation: 1
+      threadpitch: 0.5001931318638403
+    y-axis:
+      orientation: 1
+      threadpitch: 0.5001931318638403
+  port: COM10

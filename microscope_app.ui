@@ -924,22 +924,6 @@
             </widget>
            </item>
            <item>
-            <widget class="QWidget" name="widget" native="true"/>
-           </item>
-           <item>
-            <spacer name="verticalSpacer">
-             <property name="orientation">
-              <enum>Qt::Vertical</enum>
-             </property>
-             <property name="sizeHint" stdset="0">
-              <size>
-               <width>20</width>
-               <height>40</height>
-              </size>
-             </property>
-            </spacer>
-           </item>
-           <item>
             <widget class="QWidget" name="objective_container" native="true">
              <property name="font">
               <font>
@@ -990,6 +974,19 @@
             </widget>
            </item>
            <item>
+            <spacer name="verticalSpacer">
+             <property name="orientation">
+              <enum>Qt::Vertical</enum>
+             </property>
+             <property name="sizeHint" stdset="0">
+              <size>
+               <width>20</width>
+               <height>40</height>
+              </size>
+             </property>
+            </spacer>
+           </item>
+           <item>
             <widget class="QLabel" name="label">
              <property name="text">
               <string>Calibration</string>
@@ -997,19 +994,7 @@
             </widget>
            </item>
            <item>
-            <widget class="QPushButton" name="check_paralellis_button">
-             <property name="font">
-              <font>
-               <pointsize>10</pointsize>
-              </font>
-             </property>
-             <property name="text">
-              <string>Check paralellism</string>
-             </property>
-            </widget>
-           </item>
-           <item>
-            <widget class="QWidget" name="widget_2" native="true">
+            <widget class="QWidget" name="camera_calibration_widget" native="true">
              <layout class="QHBoxLayout" name="horizontalLayout_13">
               <property name="topMargin">
                <number>2</number>
@@ -1018,50 +1003,14 @@
                <number>2</number>
               </property>
               <item>
-               <widget class="QPushButton" name="pushButton_2">
+               <widget class="QPushButton" name="lineroi_button">
                 <property name="font">
                  <font>
                   <pointsize>10</pointsize>
                  </font>
                 </property>
                 <property name="text">
-                 <string>Lock first point</string>
-                </property>
-               </widget>
-              </item>
-              <item>
-               <widget class="QPushButton" name="pushButton_3">
-                <property name="font">
-                 <font>
-                  <pointsize>10</pointsize>
-                 </font>
-                </property>
-                <property name="text">
-                 <string>Select second point</string>
-                </property>
-               </widget>
-              </item>
-             </layout>
-            </widget>
-           </item>
-           <item>
-            <widget class="QWidget" name="calibrate_widget" native="true">
-             <layout class="QHBoxLayout" name="horizontalLayout_17">
-              <property name="topMargin">
-               <number>2</number>
-              </property>
-              <property name="bottomMargin">
-               <number>2</number>
-              </property>
-              <item>
-               <widget class="QPushButton" name="calibrate_button">
-                <property name="font">
-                 <font>
-                  <pointsize>10</pointsize>
-                 </font>
-                </property>
-                <property name="text">
-                 <string>Calibrate</string>
+                 <string>Line ROI</string>
                 </property>
                </widget>
               </item>
@@ -1072,10 +1021,16 @@
                   <pointsize>10</pointsize>
                  </font>
                 </property>
+                <property name="maximum">
+                 <number>99999</number>
+                </property>
+                <property name="value">
+                 <number>10</number>
+                </property>
                </widget>
               </item>
               <item>
-               <widget class="QLabel" name="nm_label">
+               <widget class="QLabel" name="um_label">
                 <property name="sizePolicy">
                  <sizepolicy hsizetype="Minimum" vsizetype="Preferred">
                   <horstretch>0</horstretch>
@@ -1100,11 +1055,35 @@
                  </font>
                 </property>
                 <property name="text">
-                 <string>nm</string>
+                 <string>um</string>
                 </property>
                </widget>
               </item>
              </layout>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="calibrate_camera_button">
+             <property name="font">
+              <font>
+               <pointsize>10</pointsize>
+              </font>
+             </property>
+             <property name="text">
+              <string>Calibrate Camera</string>
+             </property>
+            </widget>
+           </item>
+           <item>
+            <widget class="QPushButton" name="calibrate_button">
+             <property name="font">
+              <font>
+               <pointsize>10</pointsize>
+              </font>
+             </property>
+             <property name="text">
+              <string>Calibrate Stage</string>
+             </property>
             </widget>
            </item>
           </layout>
@@ -1225,6 +1204,12 @@
                         <pointsize>11</pointsize>
                        </font>
                       </property>
+                      <property name="minimum">
+                       <number>1</number>
+                      </property>
+                      <property name="maximum">
+                       <number>100</number>
+                      </property>
                       <property name="orientation">
                        <enum>Qt::Horizontal</enum>
                       </property>
@@ -1334,7 +1319,7 @@
                </widget>
               </item>
               <item>
-               <widget class="QPushButton" name="save_image">
+               <widget class="QPushButton" name="save_image_button">
                 <property name="font">
                  <font>
                   <pointsize>10</pointsize>
