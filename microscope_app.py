@@ -372,8 +372,14 @@ class MotorThread(QObject):
     def change_threadpitch(self):
         self.__stage.xmotor.threadpitch = self.xthreadpitch
         self.__stage.ymotor.threadpitch = self.ythreadpitch
-            
+
+class WorkerThread(QObject):
+    """Qt thread handling time demanding tasks and commands across threads"""
+    def __init__(self,debug=False):
+        super().__init__() 
+
 class MicroscopeApp(uiclass, baseclass):
+    """ The UI main window handling all the displays and UI interactions"""
     # Motor signals
     move_command_signal = Signal(bool,bool)
     motorspeed_change_signal = Signal(str)
