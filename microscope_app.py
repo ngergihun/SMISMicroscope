@@ -40,20 +40,20 @@ class step_mode(Enum):
     absolute = 1
 
 # Joystick package
-import pyspacemouse
+try:
+    import pyspacemouse
+except:
+    pass
 
 # Camera packages
-from ids_peak import ids_peak
-from ids_peak_ipl import ids_peak_ipl
-from ids_peak import ids_peak_ipl_extension
+try:
+    from camera.camera import IDS_Camera
+except:
+    pass
 
-from camera.camera import IDS_Camera
 from skimage.registration import phase_cross_correlation
 from skimage.color import rgb2gray, rgba2rgb
-
-FPS_LIMIT = 50
-# TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGBa8
-TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGB8
+from skimage.transform import resize
 
 # UI import
 ui_file_name = 'microscope_app.ui'
@@ -71,21 +71,19 @@ class CameraThread(QObject):
 
         try:
             self.camera = IDS_Camera()
+            if self.camera.open_device():
+                logging.info(f"Camera: {self.camera.name}")
+                # Timers
+                self.__init_timers()
+                # Flags set by the UI thread
+                self.freerun_enabled = False
+                # Other
+                self.__freerun_error_counter = 0
+            else:
+                self.camera.destroy_all()
+                logging.critical("Could not connect to camera")
         except:
             self.camera = None
-
-        if self.camera.open_device():
-            logging.info(f"Camera: {self.camera.name}")
-        else:
-            self.camera.destroy_all()
-            logging.critical("Could not connect to camera")
-
-        # Timers
-        self.__init_timers()
-        # Flags set by the UI thread
-        self.__freerun_enabled = False
-        # Other
-        self.__freerun_error_counter = 0
 
     @Slot()
     def start_freerun(self):
@@ -94,15 +92,11 @@ class CameraThread(QObject):
 
         :return: True/False if acquisition start was successful
         """
-        # Check that a device is opened and that the acquisition is NOT running. If not, return.
         if self.camera.device is None:
             return False
-
-        # Get the maximum framerate possible, limit it to the configured FPS_LIMIT. If the limit can't be reached, set
-        # acquisition interval to the maximum possible framerate
         
         if self.camera.set_continuous():
-            self.__freerun_enabled = True
+            self.freerun_enabled = True
             self.__freerun_timer.setInterval(int(1 / self.camera.framerate) * 1000)
             self.__freerun_timer.start()
             logging.info("Freerun started")
@@ -120,7 +114,7 @@ class CameraThread(QObject):
         logging.info("Freerun stopped")
         self.__freerun_timer.stop()
         self.camera.stop_acquisition()
-        self.__freerun_enabled = False
+        self.freerun_enabled = False
     
     @Slot()
     def on_exposure_change(self,value):
@@ -145,12 +139,13 @@ class CameraThread(QObject):
         try:
             self.image = self.camera.get_image()
             self.progress.emit()
-        except ids_peak.Exception as e:
+        except:
             self.__freerun_error_counter += 1
-            logging.error("Could not get image: " + str(e))
+            logging.error("Could not get image")
 
     def __del__(self):
-        self.camera.destroy_all()
+        if self.camera:
+            self.camera.destroy_all()
 
 class MotorThread(QObject):
     """Qt thread handling the motor control (including joystick handling) independently from the UI"""
@@ -331,11 +326,11 @@ class MotorThread(QObject):
         self.pos_updated.emit()
     
     @Slot()
-    def on_control_mode_change(self, tabindex):
-        if tabindex == 0:
+    def on_control_mode_change(self, modeindex):
+        if modeindex == 0:
             self.__activate_pointmove()
 
-        elif tabindex == 1:
+        elif modeindex == 1:
             self.__activate_velocitymove()
 
     @Slot()
@@ -468,7 +463,7 @@ class MicroscopeApp(uiclass, baseclass):
             self.y_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             self.z_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             # calibrate
-            self.calibrate_button.clicked.connect(self.calibrate_pixels)
+            self.calibrate_button.clicked.connect(self.calibrate_stage)
             # Settings change
             self.set_threadpitches.connect(self.motor_worker.change_threadpitch)
 
@@ -660,8 +655,9 @@ class MicroscopeApp(uiclass, baseclass):
         self.rewrite_config()
         logging.info(f"Config updated for {self.objective_combo.currentText()}")
 
-    def calibrate_pixels(self):
-        self.start_stage_calibration(xsteps=300,ysteps=300)
+    def calibrate_stage(self):
+        """ Function to initiate stage calibration """
+        self.start_stage_calibration(xsteps=700,ysteps=700)
         
     def start_stage_calibration(self, xsteps, ysteps):
         button = QtWidgets.QMessageBox.question(self,"Question dialog","Do you want to proceed?")
@@ -670,8 +666,7 @@ class MicroscopeApp(uiclass, baseclass):
         else:
             return
         # Grab an image
-        # NOTE: Do it smarter, dont check the button, but the camera itself
-        if self.camera_start_button.isChecked():
+        if self.camera_worker.freerun_enabled:
             image1 = rgb2gray(rgba2rgb(self.camera_worker.camera.image))
             logging.info("First image captured!")
         else:
@@ -708,13 +703,12 @@ class MicroscopeApp(uiclass, baseclass):
         logging.info(f"X-steps_per_pixel: {self.Xsteps_per_pixel}")
         self.Ysteps_per_pixel = np.abs(ysteps/shift[0])
         logging.info(f"Y-steps_per_pixel: {self.Ysteps_per_pixel}")
-        self.steps_per_pixel = (self.Xsteps_per_pixel+self.Ysteps_per_pixel)/2 # TODO: generalize for different axes
 
-        self.motor_worker.xthreadpitch = self.microns_per_pixel/self.steps_per_pixel*self.motor_worker.microsteps_per_rev/1000
-        self.motor_worker.ythreadpitch = self.motor_worker.xthreadpitch
+        self.motor_worker.xthreadpitch = self.microns_per_pixel/self.Xsteps_per_pixel*self.motor_worker.microsteps_per_rev/1000
+        self.motor_worker.ythreadpitch = self.microns_per_pixel/self.Ysteps_per_pixel*self.motor_worker.microsteps_per_rev/1000
         self.set_threadpitches.emit()
 
-        logging.info(f"New steps/pixel: {self.steps_per_pixel}, threadpitches: {self.motor_worker.xthreadpitch}")
+        logging.info(f"New threadpitches: {self.motor_worker.xthreadpitch, self.motor_worker.ythreadpitch}")
 
         # Set the velocity to the original
         self.motorspeed_change_signal.emit(self.motor_worker.speed_range)
@@ -772,14 +766,15 @@ class MicroscopeApp(uiclass, baseclass):
         # Grab an image
         if self.camera_start_button.isChecked():
             image = self.camera_worker.camera.image
+            image = resize(image, (image.shape[0] // 4, image.shape[1] // 4), anti_aliasing=False)
             self.fixed_image = pg.ImageItem(image=image)
 
-            newdx = -np.shape(image)[1]/2*self.microns_per_pixel-self.motor_worker.xpos
-            newdy = -np.shape(image)[0]/2*self.microns_per_pixel+self.motor_worker.ypos
+            newdx = -np.shape(image)[1]/2*self.microns_per_pixel*4-self.motor_worker.xpos
+            newdy = -np.shape(image)[0]/2*self.microns_per_pixel*4+self.motor_worker.ypos
 
             tr = QtGui.QTransform()
             tr.translate(newdx,newdy)
-            tr.scale(self.microns_per_pixel,self.microns_per_pixel)
+            tr.scale(self.microns_per_pixel*4,self.microns_per_pixel*4)
             self.fixed_image.setTransform(tr)
 
             self.image_view_area.addItem(self.fixed_image)

@@ -30,6 +30,8 @@ class BaseCamera:
 
 
 class IDS_Camera(BaseCamera):
+    TARGET_PIXEL_FORMAT = ids_peak_ipl.PixelFormatName_RGB8
+    FPS_LIMIT = 50
     def __init__(self) -> None:
         super().__init__()
 
@@ -198,7 +200,6 @@ class IDS_Camera(BaseCamera):
         # Get the maximum framerate possible, limit it to the configured fps_limit. If the limit can't be reached, set
         # acquisition interval to the maximum possible framerate
         try:
-            self.max_framerate = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
             target_fps = min(self.max_framerate, fps)
             self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").SetValue(target_fps)
         except ids_peak.Exception:
@@ -277,6 +278,8 @@ class IDS_Camera(BaseCamera):
         
         self.min_exposure_time = self.__nodemap_remote_device.FindNode("ExposureTime").Minimum()
         self.max_exposure_time = self.__nodemap_remote_device.FindNode("ExposureTime").Maximum()
+
+        self.max_framerate = self.__nodemap_remote_device.FindNode("AcquisitionFrameRate").Maximum()
 
     def get_image(self):
         """
