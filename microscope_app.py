@@ -375,8 +375,42 @@ class MotorThread(QObject):
 
 class WorkerThread(QObject):
     """Qt thread handling time demanding tasks and commands across threads"""
-    def __init__(self,debug=False):
-        super().__init__() 
+    move_signal = Signal(bool,bool) # relative=True, stepunit=True
+    register_mosaic_image_signal = Signal()
+    motorspeed_change_signal = Signal(str)
+
+    def __init__(self,motor_worker: MotorThread, camera_worker: CameraThread,debug=False):
+        super().__init__()
+
+        self. motor_worker = motor_worker
+        self.camera_worker = camera_worker
+
+        self.mosaic_moves_x = []
+        self.mosaic_moves_y = []
+    
+    def move_stage(self,xmove,ymove,zmove,relative=True):
+        self.motor_worker.target_xmove = xmove
+        self.motor_worker.target_ymove = ymove
+        self.motor_worker.target_zmove = zmove
+
+        unitbool = (self.motor_worker.unit == units.steps)
+
+        if relative is True:
+            self.move_signal.emit(True,unitbool)
+        elif relative is False:
+            self.move_signal.emit(False,unitbool)
+
+    def measure_mosaic(self):
+        self.register_mosaic_image_signal.emit()
+        for i in range(len(self.mosaic_moves_x)):
+            sleep(1)
+            self.move_stage(xmove=self.mosaic_moves_x[i],ymove=self.mosaic_moves_y[i],zmove=0,relative=True)
+            sleep(0.1)
+            while self.motor_worker.moving:
+                sleep(0.1)
+            logging.info(f"Mosaic: Move - ({self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
+            self.motorspeed_change_signal.emit(self.motor_worker.speed_range)
+            self.register_mosaic_image_signal.emit()
 
 class MicroscopeApp(uiclass, baseclass):
     """ The UI main window handling all the displays and UI interactions"""
@@ -390,6 +424,9 @@ class MicroscopeApp(uiclass, baseclass):
     camera_start_signal = Signal()
     camera_stop_signal = Signal()
     set_exposure_signal = Signal(int)
+
+    # Mosaic measurement
+    start_mosaic_signal = Signal()
 
     def __init__(self):
         super().__init__()
@@ -425,6 +462,12 @@ class MicroscopeApp(uiclass, baseclass):
         self.motor_worker.moveToThread(self.motor_thread)
         self.motor_thread.start()
 
+    # Create the TASK WORKER thread
+        self.worker = WorkerThread(self.motor_worker,self.camera_worker)
+        self.worker_thread = QThread()
+        self.worker.moveToThread(self.worker_thread)
+        self.worker_thread.start()
+
     # Timer to locally monitor the movement
         self.moving_timer = QTimer()
         self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
@@ -443,14 +486,16 @@ class MicroscopeApp(uiclass, baseclass):
             self.low_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.low_speed_radio))
             self.mid_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.mid_speed_radio))
             self.high_speed_radio.toggled.connect(lambda: self.speed_selection_changed(self.high_speed_radio))
-            # Unit switch radiobuttons
-            # self.steps_radio.toggled.connect(lambda: self.distance_unit_changed(self.steps_radio))
-            # self.microns_radio.toggled.connect(lambda: self.distance_unit_changed(self.microns_radio))
             # Move and position reset buttons
             self.move_button.clicked.connect(self.move_to_buttoncall)
             self.move_command_signal.connect(self.motor_worker.move_to_point)
             self.reset_pos_button.clicked.connect(self.motor_worker.reset_position)
             self.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
+            #Mosaic start from worker thread
+            self.start_mosaic_signal.connect(self.worker.measure_mosaic)
+            # Worker move signals
+            self.worker.move_signal.connect(self.motor_worker.move_to_point)
+            self.worker.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
             # Connect move button signals
             self.y_up.pressed.connect(lambda: self.movebutton_on_click(self.y_up))
             self.y_up.released.connect(lambda: self.movebutton_on_release(self.y_up))
@@ -485,10 +530,13 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_start_button.clicked.connect(self.start_stop_camera)
         self.camera_start_signal.connect(self.camera_worker.start_freerun)
         self.camera_stop_signal.connect(self.camera_worker.stop_freerun)
-        self.register_image_button.clicked.connect(self.register_image_to_map)
+        # self.register_image_button.clicked.connect(self.worker.register_mosaic_image_signal.emit)
+        self.register_image_button.clicked.connect(self.start_mosaic)
         self.lineroi_button.clicked.connect(self.draw_calibration_roi)
         self.calibrate_camera_button.clicked.connect(self.calibrate_camera)
         self.save_image_button.clicked.connect(self.save_image)
+        # Worker camera-related signals
+        self.worker.register_mosaic_image_signal.connect(self.register_image_to_map)
 
     # IMAGE DISPLAY AREA SETUP
         self.imItem = pg.ImageItem(np.zeros((2076,3088,4), dtype="uint8"), autoLevels=False)             # create an ImageItem
@@ -541,10 +589,10 @@ class MicroscopeApp(uiclass, baseclass):
         unitbool = (self.motor_worker.unit == units.steps)
 
         if self.relative_move_radio.isChecked():
-            self.move_command_signal.emit(True,unitbool)
+            self.worker.move_signal.emit(True,unitbool)
 
         if self.absolute_move_radio.isChecked():
-            self.move_command_signal.emit(False,unitbool)
+            self.worker.move_signal.emit(False,unitbool)
 
     def distance_unit_changed(self, button):
         if button.isChecked():
@@ -557,12 +605,11 @@ class MicroscopeApp(uiclass, baseclass):
 
     def speed_selection_changed(self, button):
         if button.isChecked():
-            # self.speed_range = button.text()
+            self.worker.speed_range = button.text()
             self.motorspeed_change_signal.emit(button.text())
 
     def movebutton_on_release(self, button):
         """ Turns off the motor moved by the buttons"""
-        # self.
         self.button_move_command.emit("")
 
     def movebutton_on_click(self, button):
@@ -589,14 +636,11 @@ class MicroscopeApp(uiclass, baseclass):
         
         logging.info(f"X pixel coordinate: {self.click_x}, Y pixel coordinate {self.click_y}")
         
-        # self.motorspeed_change_signal.emit(self.motor_worker.speed_range)
-        self.move_command_signal.emit(False,False)
+        self.worker.move_signal.emit(False,False)
         self.click_move_enabled = False
 
-        sleep(0.1)
         self.moving_timer = QTimer()
         self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        # self.moving_timer.timeout.connect(lambda: self.run_when_stopped(self.motorspeed_change_signal.emit, self.motor_worker.speed_range))
         self.moving_timer.timeout.connect(lambda: self.run_when_stopped(self.click_move_end))
         self.moving_timer.start(200)
 
@@ -768,6 +812,7 @@ class MicroscopeApp(uiclass, baseclass):
         else:
             return
 
+    @Slot()
     def register_image_to_map(self):
         # Grab an image
         if self.camera_start_button.isChecked():
@@ -789,6 +834,33 @@ class MicroscopeApp(uiclass, baseclass):
         else:
             logging.error("Camera is not enabled, cannot grab image!")
 
+    def start_mosaic(self):
+        size_x = 4*self.camera_worker.camera.image_width*self.microns_per_pixel
+        size_y = 3*self.camera_worker.camera.image_height*self.microns_per_pixel
+
+        dx = self.camera_worker.camera.image_width*self.microns_per_pixel
+        dy = self.camera_worker.camera.image_height*self.microns_per_pixel
+
+        xpos = np.arange(start=0,stop=size_x,step=dx)
+        ypos = np.arange(start=0,stop=size_y,step=dy)
+
+        xv, yv = np.meshgrid(xpos, ypos)
+
+        xvec = xv.ravel()
+        yvec = yv.ravel()
+
+        relsteps_x = np.diff(xvec)
+        relsteps_y = np.diff(yvec)
+
+        print(f"X coordinates from starting corner: {xvec}")
+        print(f"Y coordinates from starting corner: {yvec}")
+        print(f"dX steps from starting corner: {relsteps_x}")
+        print(f"dY steps from starting corner: {relsteps_y}")
+
+        self.worker.mosaic_moves_x = relsteps_x
+        self.worker.mosaic_moves_y = relsteps_y
+
+        self.start_mosaic_signal.emit()
 
 # OTHER FUNCTIONS
     def load_config(self):
