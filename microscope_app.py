@@ -158,6 +158,7 @@ class MotorThread(QObject):
         self.xpos = None
         self.ypos = None
         self.zpos = 0
+        self.auto_update = True
         self.moving = False
         self.target_xmove = 0
         self.target_ymove = 0
@@ -226,7 +227,7 @@ class MotorThread(QObject):
         self.__timer_pos_update = QTimer(self)
         self.__timer_pos_update.setTimerType(QtCore.Qt.PreciseTimer)
         self.__timer_pos_update.timeout.connect(self.__read_position)
-        self.__timer_pos_update.start(100)
+        self.__timer_pos_update.start(50)
 
     def __read_position(self):
         if self.unit == units.steps:
@@ -238,7 +239,8 @@ class MotorThread(QObject):
 
         self.moving = self.__stage.is_moving()
 
-        self.pos_updated.emit()
+        if self.auto_update:
+            self.pos_updated.emit()
 
     def __set_stage_speed(self, motor, speed=1):
         newv = int(motor.microsteps_per_rev * speed)
@@ -275,6 +277,7 @@ class MotorThread(QObject):
 
         for motor in [self.__stage.xmotor, self.__stage.ymotor]:
             motor.set_mode(move_modes.ramp)
+        self.controlmode = move_modes.velocity
         logging.info("Set Ramp mode")
 
     def __activate_velocitymove(self):
@@ -283,6 +286,7 @@ class MotorThread(QObject):
         try:
             self.__success_mouse_open = pyspacemouse.open()
             self.on_speed_selection_changed(self.speed_range)
+            self.controlmode = move_modes.velocity
         except:
             self.__success_mouse_open = None
             logging.warning("Warning Could not open 3D mouse!")
@@ -323,7 +327,15 @@ class MotorThread(QObject):
     @Slot()
     def on_position_update(self):
         self.__read_position()
-        self.pos_updated.emit()
+        if not self.auto_update:
+            self.pos_updated.emit()
+
+    @Slot()
+    def on_auto_update(self,state=True):
+        if state:
+            self.__timer_pos_update.start(50)
+        else:
+            self.__timer_pos_update.stop()
     
     @Slot()
     def on_control_mode_change(self, modeindex):
@@ -375,14 +387,17 @@ class MotorThread(QObject):
 
 class WorkerThread(QObject):
     """Qt thread handling time demanding tasks and commands across threads"""
+    update_position_signal = Signal()
     move_signal = Signal(bool,bool) # relative=True, stepunit=True
     register_mosaic_image_signal = Signal()
     motorspeed_change_signal = Signal(str)
+    stop_auto_pos_update_signal = Signal(bool)
+    start_auto_pos_update_signal = Signal(bool)
 
     def __init__(self,motor_worker: MotorThread, camera_worker: CameraThread,debug=False):
         super().__init__()
 
-        self. motor_worker = motor_worker
+        self.motor_worker = motor_worker
         self.camera_worker = camera_worker
 
         self.mosaic_moves_x = []
@@ -403,7 +418,7 @@ class WorkerThread(QObject):
     def measure_mosaic(self):
         self.register_mosaic_image_signal.emit()
         for i in range(len(self.mosaic_moves_x)):
-            sleep(1)
+            sleep(0.1)
             self.move_stage(xmove=self.mosaic_moves_x[i],ymove=self.mosaic_moves_y[i],zmove=0,relative=True)
             sleep(0.1)
             while self.motor_worker.moving:
@@ -473,6 +488,9 @@ class MicroscopeApp(uiclass, baseclass):
         self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
         # self.moving_timer.timeout.connect(self.get_movement)
 
+    # Data structures
+        self.mosaic_images = []
+
     # SIGNAL connects to MOTOR related command signals and buttons
         self.objective_combo.currentIndexChanged.connect(self.objective_change)
         self.click_move_button.clicked.connect(self.click_move_enable)
@@ -496,6 +514,9 @@ class MicroscopeApp(uiclass, baseclass):
             # Worker move signals
             self.worker.move_signal.connect(self.motor_worker.move_to_point)
             self.worker.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
+            self.worker.update_position_signal.connect(self.motor_worker.on_position_update)
+            self.worker.stop_auto_pos_update_signal.connect(lambda: self.motor_worker.on_auto_update(False))
+            self.worker.start_auto_pos_update_signal.connect(lambda: self.motor_worker.on_auto_update(True))
             # Connect move button signals
             self.y_up.pressed.connect(lambda: self.movebutton_on_click(self.y_up))
             self.y_up.released.connect(lambda: self.movebutton_on_release(self.y_up))
@@ -673,8 +694,8 @@ class MicroscopeApp(uiclass, baseclass):
     def update_image_scales(self):
         tr = self.imItem.transform()
 
-        newdx = -3088/2*self.microns_per_pixel-self.motor_worker.xpos
-        newdy = -2076/2*self.microns_per_pixel+self.motor_worker.ypos
+        newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel-self.motor_worker.xpos
+        newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel+self.motor_worker.ypos
 
         if self.motor_worker.unit == units.microns:
             tr.reset()
@@ -683,6 +704,8 @@ class MicroscopeApp(uiclass, baseclass):
             self.imItem.setTransform(tr)
             self.crosshair_vLine.setPos(self.motor_worker.xpos*-1.0)
             self.crosshair_hLine.setPos(self.motor_worker.ypos)
+            # self.crosshair_hLine.setZValue(1)
+            # self.crosshair_vLine.setZValue(1)
         elif self.motor_worker.unit == units.steps:
             pass
 
@@ -818,7 +841,7 @@ class MicroscopeApp(uiclass, baseclass):
         if self.camera_start_button.isChecked():
             image = self.camera_worker.camera.image
             image = resize(image, (image.shape[0] // 4, image.shape[1] // 4), anti_aliasing=False)
-            self.fixed_image = pg.ImageItem(image=image)
+            self.mosaic_images.append(pg.ImageItem(image=image))
 
             newdx = -np.shape(image)[1]/2*self.microns_per_pixel*4-self.motor_worker.xpos
             newdy = -np.shape(image)[0]/2*self.microns_per_pixel*4+self.motor_worker.ypos
@@ -826,11 +849,12 @@ class MicroscopeApp(uiclass, baseclass):
             tr = QtGui.QTransform()
             tr.translate(newdx,newdy)
             tr.scale(self.microns_per_pixel*4,self.microns_per_pixel*4)
-            self.fixed_image.setTransform(tr)
+            self.mosaic_images[-1].setTransform(tr)
 
-            self.image_view_area.addItem(self.fixed_image)
+            self.image_view_area.addItem(self.mosaic_images[-1])
+            self.mosaic_images[-1].setZValue(-1*len(self.mosaic_images))
 
-            print(f"Size of image array: {sys.getsizeof(image)/1000000}")
+            print(f"Memory taken by image: {sys.getsizeof(image)/1000000}")
         else:
             logging.error("Camera is not enabled, cannot grab image!")
 
