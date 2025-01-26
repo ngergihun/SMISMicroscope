@@ -16,6 +16,7 @@ import yaml
 
 # GUI modules
 from PySide6 import QtWidgets, QtGui
+from PySide6.QtWidgets import QMessageBox
 from PySide6 import QtCore
 from PySide6.QtCore import QObject, QThread, Signal, Slot, QTimer
 import pyqtgraph as pg
@@ -389,7 +390,7 @@ class WorkerThread(QObject):
     """Qt thread handling time demanding tasks and commands across threads"""
     update_position_signal = Signal()
     move_signal = Signal(bool,bool) # relative=True, stepunit=True
-    register_mosaic_image_signal = Signal()
+    register_image_signal = Signal()
     motorspeed_change_signal = Signal(str)
     stop_auto_pos_update_signal = Signal(bool)
     start_auto_pos_update_signal = Signal(bool)
@@ -416,7 +417,7 @@ class WorkerThread(QObject):
             self.move_signal.emit(False,unitbool)
 
     def measure_mosaic(self):
-        self.register_mosaic_image_signal.emit()
+        self.register_image_signal.emit()
         for i in range(len(self.mosaic_moves_x)):
             sleep(0.1)
             self.move_stage(xmove=self.mosaic_moves_x[i],ymove=self.mosaic_moves_y[i],zmove=0,relative=True)
@@ -425,7 +426,7 @@ class WorkerThread(QObject):
                 sleep(0.1)
             logging.info(f"Mosaic: Move - ({self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
             self.motorspeed_change_signal.emit(self.motor_worker.speed_range)
-            self.register_mosaic_image_signal.emit()
+            self.register_image_signal.emit()
 
 class MicroscopeApp(uiclass, baseclass):
     """ The UI main window handling all the displays and UI interactions"""
@@ -490,6 +491,11 @@ class MicroscopeApp(uiclass, baseclass):
 
     # Data structures
         self.mosaic_images = []
+        self.all_mosaics = {"center": [],
+                            "scale": [],
+                            "images": []}
+        self.mosaic_corner1 = None
+        self.mosaic_corner2 = None
 
     # SIGNAL connects to MOTOR related command signals and buttons
         self.objective_combo.currentIndexChanged.connect(self.objective_change)
@@ -498,6 +504,7 @@ class MicroscopeApp(uiclass, baseclass):
             # Position update
             self.motor_worker.pos_updated.connect(self.position_label_update)
             self.motor_worker.pos_updated.connect(self.update_image_scales)
+            self.motor_worker.pos_updated.connect(lambda: self.update_position_marker(-1*self.motor_worker.xpos,self.motor_worker.ypos))
             # Tab change to control mode change (joystick/velocity or pointmove/ramp mode)
             self.control_tab.currentChanged.connect(self.motor_worker.on_control_mode_change)
             # Speed switch radiobuttons
@@ -551,17 +558,18 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_start_button.clicked.connect(self.start_stop_camera)
         self.camera_start_signal.connect(self.camera_worker.start_freerun)
         self.camera_stop_signal.connect(self.camera_worker.stop_freerun)
-        # self.register_image_button.clicked.connect(self.worker.register_mosaic_image_signal.emit)
-        self.register_image_button.clicked.connect(self.start_mosaic)
+        self.register_image_button.clicked.connect(self.worker.register_image_signal.emit)
+        self.start_mosaic_button.clicked.connect(self.start_mosaic)
         self.lineroi_button.clicked.connect(self.draw_calibration_roi)
         self.calibrate_camera_button.clicked.connect(self.calibrate_camera)
         self.save_image_button.clicked.connect(self.save_image)
         # Worker camera-related signals
-        self.worker.register_mosaic_image_signal.connect(self.register_image_to_map)
+        self.worker.register_image_signal.connect(self.register_image_to_map)
 
     # IMAGE DISPLAY AREA SETUP
+        # For the live view window
         self.imItem = pg.ImageItem(np.zeros((2076,3088,4), dtype="uint8"), autoLevels=False)             # create an ImageItem
-        self.image_view_area.addItem(self.imItem)                                                   # add it to the PlotWidget
+        self.image_view_area.addItem(self.imItem)                                              # add it to the PlotWidget
         self.imItem.hoverEvent = self.imageHoverEvent
         self.imItem.mouseClickEvent = self.imageClickEvent
         self.customize_display()
@@ -570,6 +578,12 @@ class MicroscopeApp(uiclass, baseclass):
         tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
         tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
         self.imItem.setTransform(tr)
+
+        # For the mosaic view
+        self.mosaic_plotItem = self.map_view_area.getPlotItem()
+        self.mosaic_plotItem.scene().sigMouseMoved.connect(self.mosaicHoverEvent)
+        self.mosaic_plotItem.scene().sigMouseClicked.connect(self.mosaic_imageClickEvent)
+        self.customize_map_view()
 
 # IMAGE DISPLAY CUSTOMIZATION
     def customize_display(self):
@@ -587,7 +601,43 @@ class MicroscopeApp(uiclass, baseclass):
         self.crosshair_hLine = pg.InfiniteLine(angle=0, movable=False)
         self.image_view_area.addItem(self.crosshair_vLine, ignoreBounds=True)
         self.image_view_area.addItem(self.crosshair_hLine, ignoreBounds=True)
+    
+    def customize_map_view(self):
+        self.map_view_area.setBackground('w')
+        self.map_view_area.setAspectLocked(True)
+        self.map_view_area.invertY(True)
+        self.map_view_area.getAxis('left').setTextPen('black')
+        self.map_view_area.getAxis('bottom').setTextPen('black')
+        self.map_view_area.getAxis('bottom').setLabel('X position / μm')
+        self.map_view_area.getAxis('left').setLabel('Y position / μm')
+        self.map_view_area.showAxes(True)
+        self.map_view_area.setAspectLocked(True)
+        self.map_view_area.setMouseTracking(True)
+        self.mosaic_crosshair_vLine = pg.InfiniteLine(angle=90, movable=False)
+        self.mosaic_crosshair_hLine = pg.InfiniteLine(angle=0, movable=False)
+        self.map_view_area.addItem(self.mosaic_crosshair_vLine, ignoreBounds=True)
+        self.map_view_area.addItem(self.mosaic_crosshair_hLine, ignoreBounds=True)
 
+        self.map_cursor = QtCore.Qt.CrossCursor
+        self.map_view_area.setCursor(self.map_cursor)
+
+        self.position_arrows = [pg.ArrowItem(angle=0), pg.ArrowItem(angle=90), pg.ArrowItem(angle=180), pg.ArrowItem(angle=270)]
+        self.posmarker_text = pg.TextItem("test",anchor=(0,1.0))
+        self.posmarker_text.setPos(0,0)
+        self.posmarker_text.setText('[%0.1f, %0.1f]' % (0, 0))
+        for arrow in self.position_arrows:
+            self.map_view_area.addItem(arrow)
+
+        self.map_view_area.addItem(self.posmarker_text)
+
+    def update_position_marker(self,xpos,ypos):
+        """ Updates the location and text of the marker for the actual position in the map view"""
+        for arrow in self.position_arrows:
+            arrow.setPos(xpos,ypos)
+            self.posmarker_text.setPos(xpos,ypos)
+            self.posmarker_text.setText('[%0.2f, %0.2f]' % (xpos, ypos))
+
+        
 # MOTOR RELATED FUNCTIONS
     def get_movement(self):
         return self.motor_worker.moving
@@ -650,6 +700,16 @@ class MicroscopeApp(uiclass, baseclass):
         if self.click_move_enabled:
             self.click_move()
 
+    def mosaic_imageClickEvent(self, event):
+        # Get mouse position
+        pos = event.scenePos()
+        mousePoint = self.mosaic_plotItem.vb.mapSceneToView(pos)
+        print(f"x: {mousePoint.x()},y: {mousePoint.y()}")
+        self.click_x, self.click_y = mousePoint.x(), mousePoint.y()
+
+        if self.click_move_enabled:
+            self.click_move()
+
     def click_move(self):
         """ Initiates position movement by clicking on the image"""
         self.motor_worker.target_xmove = -self.click_x
@@ -683,6 +743,17 @@ class MicroscopeApp(uiclass, baseclass):
         x, y = ppos.x(), ppos.y()
         # self.image_view_area.setTitle("pos: (%0.1f, %0.1f)  pixel: (%d, %d)  value: %.3g" % (x, y, i, j, val))
         self.image_view_area.setTitle("pos: (%0.1f, %0.1f)  pixel: (%d, %d)"  % (x, y, i, j))
+    
+    def mosaicHoverEvent(self,event):
+        # Show the position under the mouse cursor.
+        pos = event
+        if self.mosaic_plotItem.sceneBoundingRect().contains(pos):
+            mousePoint = self.mosaic_plotItem.vb.mapSceneToView(pos)
+            i = mousePoint.y()
+            j = mousePoint.x()
+        self.mosaic_crosshair_hLine.setPos(i)
+        self.mosaic_crosshair_vLine.setPos(j)
+        self.map_view_area.setTitle("Cursor position: (%0.2f, %0.2f)"  % (i, j))
 
     def click_move_enable(self):
         if self.click_move_button.isChecked():
@@ -851,40 +922,56 @@ class MicroscopeApp(uiclass, baseclass):
             tr.scale(self.microns_per_pixel*4,self.microns_per_pixel*4)
             self.mosaic_images[-1].setTransform(tr)
 
-            self.image_view_area.addItem(self.mosaic_images[-1])
+            self.map_view_area.addItem(self.mosaic_images[-1])
             self.mosaic_images[-1].setZValue(-1*len(self.mosaic_images))
 
-            print(f"Memory taken by image: {sys.getsizeof(image)/1000000}")
+            logging.info(f"Image registered at x:{self.motor_worker.xpos}, y:{self.motor_worker.ypos}")
         else:
             logging.error("Camera is not enabled, cannot grab image!")
 
+    def set_mosaic_corner1(self):
+        self.mosaic_corner1 = (self.motor_worker.xpos,self.motor_worker.ypos)
+    def set_mosaic_corner2(self):
+        self.mosaic_corner2 = (self.motor_worker.xpos,self.motor_worker.ypos)
+
     def start_mosaic(self):
-        size_x = 4*self.camera_worker.camera.image_width*self.microns_per_pixel
-        size_y = 3*self.camera_worker.camera.image_height*self.microns_per_pixel
 
-        dx = self.camera_worker.camera.image_width*self.microns_per_pixel
-        dy = self.camera_worker.camera.image_height*self.microns_per_pixel
+        if self.mosaic_corner1 or self.mosaic_corner2 is not None:
+            size_x = 4*self.camera_worker.camera.image_width*self.microns_per_pixel
+            size_y = 3*self.camera_worker.camera.image_height*self.microns_per_pixel
 
-        xpos = np.arange(start=0,stop=size_x,step=dx)
-        ypos = np.arange(start=0,stop=size_y,step=dy)
+            dx = self.camera_worker.camera.image_width*self.microns_per_pixel
+            dy = self.camera_worker.camera.image_height*self.microns_per_pixel
 
-        xv, yv = np.meshgrid(xpos, ypos)
+            xpos = np.arange(start=0,stop=size_x,step=dx)
+            ypos = np.arange(start=0,stop=size_y,step=dy)
 
-        xvec = xv.ravel()
-        yvec = yv.ravel()
+            xv, yv = np.meshgrid(xpos, ypos)
 
-        relsteps_x = np.diff(xvec)
-        relsteps_y = np.diff(yvec)
+            xvec = xv.ravel()
+            yvec = yv.ravel()
 
-        print(f"X coordinates from starting corner: {xvec}")
-        print(f"Y coordinates from starting corner: {yvec}")
-        print(f"dX steps from starting corner: {relsteps_x}")
-        print(f"dY steps from starting corner: {relsteps_y}")
+            relsteps_x = np.diff(xvec)
+            relsteps_y = np.diff(yvec)
 
-        self.worker.mosaic_moves_x = relsteps_x
-        self.worker.mosaic_moves_y = relsteps_y
+            print(f"X coordinates from starting corner: {xvec}")
+            print(f"Y coordinates from starting corner: {yvec}")
+            print(f"dX steps from starting corner: {relsteps_x}")
+            print(f"dY steps from starting corner: {relsteps_y}")
 
-        self.start_mosaic_signal.emit()
+            self.worker.mosaic_moves_x = relsteps_x
+            self.worker.mosaic_moves_y = relsteps_y
+
+            self.click_move_enabled = False
+            self.start_mosaic_signal.emit()
+        else:
+            msg = QMessageBox(self)
+            msg.setWindowTitle("Missing corner points")
+            msg.setText("Define cornerpoints first!")
+            msg.setIcon(QMessageBox.Warning)
+            msg.setStandardButtons(QMessageBox.Close)
+            msg.setInformativeText("Set both corner points of the mosaic map and start again!")
+            msg.exec()
 
 # OTHER FUNCTIONS
     def load_config(self):
@@ -918,6 +1005,26 @@ class SingleImage():
         self.xloc = xloc
         self.yloc = yloc
 
+# Class creating a position arrow from four orthogonal ArrowItems
+class PositionArrow():
+    def __init__(self,xpos=0,ypos=0):
+
+        self.xpos = xpos
+        self.ypos = ypos
+
+        self.arrows = [pg.ArrowItem(angle=0), pg.ArrowItem(angle=90), pg.ArrowItem(angle=180), pg.ArrowItem(angle=270)]
+
+        self.setPos(self.xpos,self.ypos)
+
+    def pos(self):
+        return (self.xpos,self.ypos)
+    
+    def setPos(self,xpos,ypos):
+        self.xpos = xpos
+        self.ypos = ypos
+
+        for arrow in self.arrows:
+            arrow.setPos(self.xpos,self.ypos)
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
