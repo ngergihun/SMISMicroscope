@@ -404,29 +404,27 @@ class WorkerThread(QObject):
         self.mosaic_moves_x = []
         self.mosaic_moves_y = []
     
-    def move_stage(self,xmove,ymove,zmove,relative=True):
+    def move_stage(self,xmove,ymove,relative=True):
         self.motor_worker.target_xmove = xmove
         self.motor_worker.target_ymove = ymove
-        self.motor_worker.target_zmove = zmove
 
         unitbool = (self.motor_worker.unit == units.steps)
 
-        if relative is True:
-            self.move_signal.emit(True,unitbool)
-        elif relative is False:
-            self.move_signal.emit(False,unitbool)
+        self.move_signal.emit(relative,unitbool)
+        logging.info(f"Moving stage to x: {self.motor_worker.target_xmove}, y: {self.motor_worker.target_ymove}, relative: {relative}, unit: {self.motor_worker.unit}")
 
     def measure_mosaic(self):
-        self.register_image_signal.emit()
+        # self.register_image_signal.emit()
         for i in range(len(self.mosaic_moves_x)):
-            sleep(0.1)
-            self.move_stage(xmove=self.mosaic_moves_x[i],ymove=self.mosaic_moves_y[i],zmove=0,relative=True)
+            # Move to the new cordinate
+            self.move_stage(self.mosaic_moves_x[i],ymove=self.mosaic_moves_y[i],relative=False)
             sleep(0.1)
             while self.motor_worker.moving:
                 sleep(0.1)
-            logging.info(f"Mosaic: Move - ({self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
+            logging.info(f"Mosaic arrived to ({self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
             self.motorspeed_change_signal.emit(self.motor_worker.speed_range)
             self.register_image_signal.emit()
+            sleep(0.5)
 
 class MicroscopeApp(uiclass, baseclass):
     """ The UI main window handling all the displays and UI interactions"""
@@ -504,7 +502,7 @@ class MicroscopeApp(uiclass, baseclass):
             # Position update
             self.motor_worker.pos_updated.connect(self.position_label_update)
             self.motor_worker.pos_updated.connect(self.update_image_scales)
-            self.motor_worker.pos_updated.connect(lambda: self.update_position_marker(-1*self.motor_worker.xpos,self.motor_worker.ypos))
+            # self.motor_worker.pos_updated.connect(lambda: self.update_position_marker(-1*self.motor_worker.xpos,self.motor_worker.ypos))
             # Tab change to control mode change (joystick/velocity or pointmove/ramp mode)
             self.control_tab.currentChanged.connect(self.motor_worker.on_control_mode_change)
             # Speed switch radiobuttons
@@ -715,7 +713,7 @@ class MicroscopeApp(uiclass, baseclass):
         self.motor_worker.target_xmove = -self.click_x
         self.motor_worker.target_ymove = self.click_y
         
-        logging.info(f"X pixel coordinate: {self.click_x}, Y pixel coordinate {self.click_y}")
+        logging.info(f"X move to: {-self.click_x}, Y move to {self.click_y}")
         
         self.worker.move_signal.emit(False,False)
         self.click_move_enabled = False
@@ -862,7 +860,7 @@ class MicroscopeApp(uiclass, baseclass):
             return
         elif self.get_movement() is False:
             self.moving_timer.stop()
-            logging.info(f"Arrived to position! Function run: {func.__name__}")
+            logging.info(f"Arrived to position: x: {self.motor_worker.xpos}, y: {self.motor_worker.ypos}, Function run: {func.__name__}")
             func(*args, **kwargs)
 
     def objective_change(self):
@@ -909,17 +907,18 @@ class MicroscopeApp(uiclass, baseclass):
     @Slot()
     def register_image_to_map(self):
         # Grab an image
+        downscale = 4
         if self.camera_start_button.isChecked():
-            image = self.camera_worker.camera.image
-            image = resize(image, (image.shape[0] // 4, image.shape[1] // 4), anti_aliasing=False)
-            self.mosaic_images.append(pg.ImageItem(image=image))
+            newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel*downscale-self.motor_worker.xpos
+            newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel*downscale+self.motor_worker.ypos
 
-            newdx = -np.shape(image)[1]/2*self.microns_per_pixel*4-self.motor_worker.xpos
-            newdy = -np.shape(image)[0]/2*self.microns_per_pixel*4+self.motor_worker.ypos
+            image = self.camera_worker.camera.image
+            image = resize(image, (image.shape[0] // downscale, image.shape[1] // downscale), anti_aliasing=False)
+            self.mosaic_images.append(pg.ImageItem(image=image))
 
             tr = QtGui.QTransform()
             tr.translate(newdx,newdy)
-            tr.scale(self.microns_per_pixel*4,self.microns_per_pixel*4)
+            tr.scale(self.microns_per_pixel*downscale,self.microns_per_pixel*downscale)
             self.mosaic_images[-1].setTransform(tr)
 
             self.map_view_area.addItem(self.mosaic_images[-1])
@@ -935,8 +934,8 @@ class MicroscopeApp(uiclass, baseclass):
         self.mosaic_corner2 = (self.motor_worker.xpos,self.motor_worker.ypos)
 
     def start_mosaic(self):
-
-        if self.mosaic_corner1 or self.mosaic_corner2 is not None:
+        # TODO: Put back the NOT condition
+        if self.mosaic_corner1 or self.mosaic_corner2 is None:
             size_x = 4*self.camera_worker.camera.image_width*self.microns_per_pixel
             size_y = 3*self.camera_worker.camera.image_height*self.microns_per_pixel
 
@@ -945,22 +944,26 @@ class MicroscopeApp(uiclass, baseclass):
 
             xpos = np.arange(start=0,stop=size_x,step=dx)
             ypos = np.arange(start=0,stop=size_y,step=dy)
-
             xv, yv = np.meshgrid(xpos, ypos)
-
             xvec = xv.ravel()
             yvec = yv.ravel()
 
-            relsteps_x = np.diff(xvec)
-            relsteps_y = np.diff(yvec)
+            # define some grids
+            xgrid = np.arange(0, size_x, dx)
+            ygrid = np.arange(0, size_y, dy)
 
-            print(f"X coordinates from starting corner: {xvec}")
-            print(f"Y coordinates from starting corner: {yvec}")
-            print(f"dX steps from starting corner: {relsteps_x}")
-            print(f"dY steps from starting corner: {relsteps_y}")
+            xscan = []
+            yscan = []
 
-            self.worker.mosaic_moves_x = relsteps_x
-            self.worker.mosaic_moves_y = relsteps_y
+            for i, yi in enumerate(ygrid):
+                xscan.append(xgrid[::(-1)**i]) # reverse when i is odd
+                yscan.append(np.ones_like(xgrid) * yi)
+
+            xscan = np.concatenate(xscan)
+            yscan = np.concatenate(yscan)
+
+            self.worker.mosaic_moves_x = xscan
+            self.worker.mosaic_moves_y = yscan
 
             self.click_move_enabled = False
             self.start_mosaic_signal.emit()
