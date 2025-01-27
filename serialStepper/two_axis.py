@@ -36,8 +36,8 @@ class TwoAxisStage:
         settings2 = self.ymotor.get_settings()
 
         angle = math.atan2(deltay,deltax)
-        v = (settings1[1]+settings2[1])/2
-        a = (settings1[2]+settings2[2])/2
+        v = math.sqrt(math.pow(settings1[1],2)+math.pow(settings2[1],2))
+        a = math.sqrt(math.pow(settings1[2],2)+math.pow(settings2[2],2))
 
         speedx = abs(v*math.cos(angle))
         speedy = abs(v*math.sin(angle))
@@ -82,8 +82,8 @@ class TwoAxisStage:
         settings2 = self.ymotor.get_settings()
 
         angle = math.atan2(ysteps,xsteps)
-        v = (settings1[1]+settings2[1])/2
-        a = (settings1[2]+settings2[2])/2
+        v = math.sqrt(math.pow(settings1[1],2)+math.pow(settings2[1],2))
+        a = math.sqrt(math.pow(settings1[2],2)+math.pow(settings2[2],2))
 
         speedx = abs(v*math.cos(angle))
         speedy = abs(v*math.sin(angle))
