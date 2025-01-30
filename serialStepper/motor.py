@@ -291,7 +291,7 @@ class CustomMotor(Motor):
         if code == "VM":
             self.max_velocity = data[0]
             return data[0]
-        
+       
         return None
     
     def set_maxacceleration(self, amax = 12800):
