@@ -199,7 +199,7 @@ class MotorThread(QObject):
     def __init_stage(self, port="COM10", address_x="0",address_y="1",debug=False):
         # Initialize the stage controller
         try:
-            self.__stage_controller = serialStepper.Controller(port, debug=False)
+            self.__stage_controller = serialStepper.Controller(port, debug=debug)
             self.__stage = serialStepper.TwoAxisStage(controller=self.__stage_controller, 
                                                     address_x=address_x, 
                                                     address_y=address_y,
@@ -243,7 +243,7 @@ class MotorThread(QObject):
         if self.auto_update:
             self.pos_updated.emit()
 
-    def __set_stage_speed(self, motor, speed=1):
+    def __set_stage_speed(self, motor, speed=1.0):
         newv = int(motor.microsteps_per_rev * speed)
         newa = newv * 4
         if self.__joystick_enabled:
@@ -278,7 +278,7 @@ class MotorThread(QObject):
 
         for motor in [self.__stage.xmotor, self.__stage.ymotor]:
             motor.set_mode(move_modes.ramp)
-        self.controlmode = move_modes.velocity
+        self.controlmode = move_modes.ramp
         logging.info("Set Ramp mode")
 
     def __activate_velocitymove(self):
@@ -313,7 +313,7 @@ class MotorThread(QObject):
                             step_units=stepunit)
         else:
             logging.info("Movement definition is not clear!")
-
+        logging.info(f"Motor_worker: Moving to x: {self.target_xmove}, y: {self.target_ymove}")
         self.__read_position()
         
     @Slot()
@@ -350,15 +350,18 @@ class MotorThread(QObject):
     def on_speed_selection_changed(self, buttontext):
         if buttontext == "Low":
             for motor in [self.__stage.xmotor, self.__stage.ymotor]:
-                self.__set_stage_speed(motor, speed=0.5)               
+                self.__set_stage_speed(motor, speed=0.5)
+                logging.info(f"Speed changed to LOW")             
 
         elif buttontext == "Mid":
             for motor in [self.__stage.xmotor, self.__stage.ymotor]:
                 self.__set_stage_speed(motor, speed=1)
+                logging.info(f"Speed changed to MEDIUM")
 
         elif buttontext == "High":
             for motor in [self.__stage.xmotor, self.__stage.ymotor]:
                 self.__set_stage_speed(motor, speed=2)
+                logging.info(f"Speed changed to HIGH")
 
         self.speed_range = buttontext
 
@@ -401,8 +404,16 @@ class WorkerThread(QObject):
         self.motor_worker = motor_worker
         self.camera_worker = camera_worker
 
+        self.microns_per_pixel = None
+
+        self.moving_timer = QTimer()
+        self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
+
         self.mosaic_moves_x = []
         self.mosaic_moves_y = []
+        self.new_image_item = None
+
+        self.speed_range = "Low"
     
     def move_stage(self,xmove,ymove,relative=True):
         self.motor_worker.target_xmove = xmove
@@ -410,8 +421,29 @@ class WorkerThread(QObject):
 
         unitbool = (self.motor_worker.unit == units.steps)
 
+        logging.info(f"Worker: Moving stage to x: {self.motor_worker.target_xmove}, y: {self.motor_worker.target_ymove}, relative: {relative}, unit: {self.motor_worker.unit}")
         self.move_signal.emit(relative,unitbool)
-        logging.info(f"Moving stage to x: {self.motor_worker.target_xmove}, y: {self.motor_worker.target_ymove}, relative: {relative}, unit: {self.motor_worker.unit}")
+
+    def run_when_stopped(self, func, *args, **kwargs):
+        if self.motor_worker.moving is True:
+            return
+        elif self.motor_worker.moving is False:
+            self.moving_timer.stop()
+            logging.info(f"Arrived to position: x: {self.motor_worker.xpos}, y: {self.motor_worker.ypos}, Function run: {func.__name__}")
+            func(*args, **kwargs)
+    
+    @Slot()
+    def simple_move(self,xmove,ymove,relative=False):
+        self.move_stage(xmove,ymove,relative=relative)
+        sleep(0.1)
+        self.moving_timer = QTimer()
+        self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
+        self.moving_timer.timeout.connect(lambda: self.run_when_stopped(self.simple_move_end))
+        self.moving_timer.start(100)
+
+    def simple_move_end(self):
+        self.motorspeed_change_signal.emit(self.speed_range)
+        self.moving_timer.stop()
 
     def measure_mosaic(self):
         # self.register_image_signal.emit()
@@ -422,14 +454,32 @@ class WorkerThread(QObject):
             while self.motor_worker.moving:
                 sleep(0.1)
             logging.info(f"Mosaic arrived to ({self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
-            self.motorspeed_change_signal.emit(self.motor_worker.speed_range)
+            sleep(0.25)
+            self.motorspeed_change_signal.emit(self.speed_range)
+            self.prepare_mosaic_image_item()
             self.register_image_signal.emit()
-            sleep(0.5)
+            sleep(0.25)
+
+    def prepare_mosaic_image_item(self,downscale=4):
+        newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel*downscale-self.motor_worker.xpos
+        newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel*downscale+self.motor_worker.ypos
+
+        image = self.camera_worker.camera.image
+        image = resize(image, (image.shape[0] // downscale, image.shape[1] // downscale), anti_aliasing=False)
+
+        self.new_image_item = (pg.ImageItem(image=image))
+        tr = QtGui.QTransform()
+        tr.translate(newdx,newdy)
+        tr.scale(self.microns_per_pixel*downscale,self.microns_per_pixel*downscale)
+        self.new_image_item.setTransform(tr)
+
+        logging.info(f"New mosaic image from x:{newdx}, y:{newdy} was prepared!")
 
 class MicroscopeApp(uiclass, baseclass):
     """ The UI main window handling all the displays and UI interactions"""
     # Motor signals
     move_command_signal = Signal(bool,bool)
+    simple_move_signal = Signal(float,float,bool)
     motorspeed_change_signal = Signal(str)
     button_move_command = Signal(str)
     set_threadpitches = Signal()
@@ -471,7 +521,7 @@ class MicroscopeApp(uiclass, baseclass):
 
     # Create the STAGE CONTROLLER worker thread
         port = self.config['stage']['port']
-        self.motor_worker = MotorThread(port=port, address_x="1", address_y="0")
+        self.motor_worker = MotorThread(port=port, address_x="1", address_y="0",debug=True)
         self.motor_thread = QThread()
         self.motor_worker.moveToThread(self.motor_thread)
         self.motor_thread.start()
@@ -481,6 +531,8 @@ class MicroscopeApp(uiclass, baseclass):
         self.worker_thread = QThread()
         self.worker.moveToThread(self.worker_thread)
         self.worker_thread.start()
+        # Pass important parameters
+        self.worker.microns_per_pixel = self.microns_per_pixel
 
     # Timer to locally monitor the movement
         self.moving_timer = QTimer()
@@ -512,6 +564,7 @@ class MicroscopeApp(uiclass, baseclass):
             # Move and position reset buttons
             self.move_button.clicked.connect(self.move_to_buttoncall)
             self.move_command_signal.connect(self.motor_worker.move_to_point)
+            self.simple_move_signal.connect(self.worker.simple_move)
             self.reset_pos_button.clicked.connect(self.motor_worker.reset_position)
             self.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
             #Mosaic start from worker thread
@@ -651,17 +704,17 @@ class MicroscopeApp(uiclass, baseclass):
         self.zpos_label.setText(f'Z: {round(self.motor_worker.zpos,2)} {unit_string}')
         
     def move_to_buttoncall(self):
-        self.motor_worker.target_xmove = self.xmove_spinbox.value()
-        self.motor_worker.target_ymove = self.ymove_spinbox.value()
-        self.motor_worker.target_zmove = self.zmove_spinbox.value()
-
         unitbool = (self.motor_worker.unit == units.steps)
 
+        xtarget = float(self.xmove_spinbox.value())
+        ytarget = float(self.ymove_spinbox.value())
+        # ztarget = float(self.zmove_spinbox.value())
+
         if self.relative_move_radio.isChecked():
-            self.worker.move_signal.emit(True,unitbool)
+            self.simple_move_signal.emit(xtarget,ytarget,True)
 
         if self.absolute_move_radio.isChecked():
-            self.worker.move_signal.emit(False,unitbool)
+            self.simple_move_signal.emit(xtarget,ytarget,False)
 
     def distance_unit_changed(self, button):
         if button.isChecked():
@@ -676,6 +729,7 @@ class MicroscopeApp(uiclass, baseclass):
         if button.isChecked():
             self.worker.speed_range = button.text()
             self.motorspeed_change_signal.emit(button.text())
+            logging.debug(f"Worker speed changed to: {self.worker.speed_range}")
 
     def movebutton_on_release(self, button):
         """ Turns off the motor moved by the buttons"""
@@ -865,6 +919,7 @@ class MicroscopeApp(uiclass, baseclass):
 
     def objective_change(self):
         self.microns_per_pixel = self.config["objectives"][self.objective_combo.currentText()]["pixel_to_distance"]
+        self.worker.microns_per_pixel = self.microns_per_pixel
 
 # CAMERA RELATED FUNCTIONS
     def start_stop_camera(self):
@@ -907,24 +962,24 @@ class MicroscopeApp(uiclass, baseclass):
     @Slot()
     def register_image_to_map(self):
         # Grab an image
-        downscale = 4
+        # downscale = 4
         if self.camera_start_button.isChecked():
-            newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel*downscale-self.motor_worker.xpos
-            newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel*downscale+self.motor_worker.ypos
+            # newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel*downscale-self.motor_worker.xpos
+            # newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel*downscale+self.motor_worker.ypos
 
-            image = self.camera_worker.camera.image
-            image = resize(image, (image.shape[0] // downscale, image.shape[1] // downscale), anti_aliasing=False)
-            self.mosaic_images.append(pg.ImageItem(image=image))
+            # image = self.camera_worker.camera.image
+            # image = resize(image, (image.shape[0] // downscale, image.shape[1] // downscale), anti_aliasing=False)
 
-            tr = QtGui.QTransform()
-            tr.translate(newdx,newdy)
-            tr.scale(self.microns_per_pixel*downscale,self.microns_per_pixel*downscale)
-            self.mosaic_images[-1].setTransform(tr)
+            # self.mosaic_images.append(pg.ImageItem(image=image))
+            # tr = QtGui.QTransform()
+            # tr.translate(newdx,newdy)
+            # tr.scale(self.microns_per_pixel*downscale,self.microns_per_pixel*downscale)
+            # self.mosaic_images[-1].setTransform(tr)
 
+            self.mosaic_images.append(self.worker.new_image_item)
             self.map_view_area.addItem(self.mosaic_images[-1])
             self.mosaic_images[-1].setZValue(-1*len(self.mosaic_images))
-
-            logging.info(f"Image registered at x:{self.motor_worker.xpos}, y:{self.motor_worker.ypos}")
+            logging.info("Image registered to map!")
         else:
             logging.error("Camera is not enabled, cannot grab image!")
 

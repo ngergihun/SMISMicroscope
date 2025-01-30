@@ -13,8 +13,8 @@ class TwoAxisStage:
 
     ## Setting and getting positions
 
-    def go_to_point(self, xdistance, ydistance, step_units=False, waiting=False):
-        """Moves to a particular distance in 2D."""
+    def go_to_point(self, xdistance, ydistance, step_units=False, speed = 0.5, waiting=False):
+        """Moves to the given position in 2D."""
         if not step_units:
             xsteps = linear.distance_to_steps(xdistance,
                                                 threadpitch=self.xmotor.threadpitch,
@@ -31,9 +31,11 @@ class TwoAxisStage:
 
         deltax = xsteps-xstart
         deltay = ysteps-ystart
-
+        
         settings1 = self.xmotor.get_settings()
         settings2 = self.ymotor.get_settings()
+        print("Settings1: ", settings1)
+        print("Settings2: ", settings2)
 
         angle = math.atan2(deltay,deltax)
         v = math.sqrt(math.pow(settings1[1],2)+math.pow(settings2[1],2))
@@ -43,6 +45,15 @@ class TwoAxisStage:
         speedy = abs(v*math.sin(angle))
         accelx = abs(a*math.cos(angle))
         accely = abs(a*math.sin(angle))
+
+        if speedx < 50:
+            speedx = 50
+            accelx = 200
+        elif speedy < 50:
+            speedy = 50
+            accely = 200
+
+        print("New Speedx: ", speedx, "New Speedy: ", speedy)
 
         # Set the calculated velocities
         self.xmotor.set_maxvelocity(vmax=int(speedx))
@@ -56,7 +67,7 @@ class TwoAxisStage:
         
         if waiting is True:
             while self.is_moving():
-                time.sleep(0.01)
+                time.sleep(0.1)
             
             # Set back the original speed and accelaration
             self.xmotor.set_maxvelocity(vmax=settings1[1])
