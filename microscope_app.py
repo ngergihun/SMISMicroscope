@@ -406,6 +406,7 @@ class WorkerThread(QObject):
 
         self.microns_per_pixel = None
 
+        self.move_enabled = True
         self.moving_timer = QTimer()
         self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
 
@@ -434,16 +435,19 @@ class WorkerThread(QObject):
     
     @Slot()
     def simple_move(self,xmove,ymove,relative=False):
-        self.move_stage(xmove,ymove,relative=relative)
-        sleep(0.1)
-        self.moving_timer = QTimer()
-        self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
-        self.moving_timer.timeout.connect(lambda: self.run_when_stopped(self.simple_move_end))
-        self.moving_timer.start(100)
+        if self.move_enabled:
+            self.move_stage(xmove,ymove,relative=relative)
+            sleep(0.1)
+            self.moving_timer = QTimer()
+            self.moving_timer.setTimerType(QtCore.Qt.PreciseTimer)
+            self.moving_timer.timeout.connect(lambda: self.run_when_stopped(self.simple_move_end))
+            self.moving_timer.start(100)
+            self.move_enabled = False
 
     def simple_move_end(self):
         self.motorspeed_change_signal.emit(self.speed_range)
         self.moving_timer.stop()
+        self.move_enabled = True
 
     def measure_mosaic(self):
         # self.register_image_signal.emit()
@@ -453,7 +457,7 @@ class WorkerThread(QObject):
             sleep(0.1)
             while self.motor_worker.moving:
                 sleep(0.1)
-            logging.info(f"Mosaic arrived to ({self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
+            logging.info(f"Mosaic arrived to ({-1*self.mosaic_moves_x[i]},{self.mosaic_moves_y[i]})")
             sleep(0.25)
             self.motorspeed_change_signal.emit(self.speed_range)
             self.prepare_mosaic_image_item()
@@ -461,8 +465,8 @@ class WorkerThread(QObject):
             sleep(0.25)
 
     def prepare_mosaic_image_item(self,downscale=4):
-        newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel*downscale-self.motor_worker.xpos
-        newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel*downscale+self.motor_worker.ypos
+        newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel-self.motor_worker.xpos
+        newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel+self.motor_worker.ypos
 
         image = self.camera_worker.camera.image
         image = resize(image, (image.shape[0] // downscale, image.shape[1] // downscale), anti_aliasing=False)
@@ -554,7 +558,7 @@ class MicroscopeApp(uiclass, baseclass):
             # Position update
             self.motor_worker.pos_updated.connect(self.position_label_update)
             self.motor_worker.pos_updated.connect(self.update_image_scales)
-            # self.motor_worker.pos_updated.connect(lambda: self.update_position_marker(-1*self.motor_worker.xpos,self.motor_worker.ypos))
+            self.motor_worker.pos_updated.connect(lambda: self.update_position_marker(self.motor_worker.xpos,self.motor_worker.ypos))
             # Tab change to control mode change (joystick/velocity or pointmove/ramp mode)
             self.control_tab.currentChanged.connect(self.motor_worker.on_control_mode_change)
             # Speed switch radiobuttons
@@ -567,8 +571,10 @@ class MicroscopeApp(uiclass, baseclass):
             self.simple_move_signal.connect(self.worker.simple_move)
             self.reset_pos_button.clicked.connect(self.motor_worker.reset_position)
             self.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
-            #Mosaic start from worker thread
+            #Mosaic
             self.start_mosaic_signal.connect(self.worker.measure_mosaic)
+            self.corner1_set_button.clicked.connect(self.set_mosaic_corner1)
+            self.corner2_set_button.clicked.connect(self.set_mosaic_corner2)
             # Worker move signals
             self.worker.move_signal.connect(self.motor_worker.move_to_point)
             self.worker.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
@@ -588,6 +594,7 @@ class MicroscopeApp(uiclass, baseclass):
             self.x_left.pressed.connect(lambda: self.movebutton_on_click(self.x_left))
             self.x_left.released.connect(lambda: self.movebutton_on_release(self.x_left))
             self.x_left.setShortcut(QtGui.QKeySequence.MoveToNextChar)
+            #
             # Connect axis lock checkboxes
             self.x_lock_switch.stateChanged.connect(self.on_axis_lock_change)
             self.y_lock_switch.stateChanged.connect(self.on_axis_lock_change)
@@ -609,7 +616,7 @@ class MicroscopeApp(uiclass, baseclass):
         self.camera_start_button.clicked.connect(self.start_stop_camera)
         self.camera_start_signal.connect(self.camera_worker.start_freerun)
         self.camera_stop_signal.connect(self.camera_worker.stop_freerun)
-        self.register_image_button.clicked.connect(self.worker.register_image_signal.emit)
+        # self.register_image_button.clicked.connect(self.try_translate)
         self.start_mosaic_button.clicked.connect(self.start_mosaic)
         self.lineroi_button.clicked.connect(self.draw_calibration_roi)
         self.calibrate_camera_button.clicked.connect(self.calibrate_camera)
@@ -625,10 +632,12 @@ class MicroscopeApp(uiclass, baseclass):
         self.imItem.mouseClickEvent = self.imageClickEvent
         self.customize_display()
         
-        tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
-        tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
-        tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
-        self.imItem.setTransform(tr)
+        # tr = QtGui.QTransform()                                                                   # prepare ImageItem transformation:
+        # tr.translate(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel)               # move 3x3 image to locate center at axis origin
+        # tr.scale(self.microns_per_pixel,self.microns_per_pixel)                                    # scale horizontal and vertical axes
+        # self.imItem.setTransform(tr)
+        self.imItem.setRect(-3088/2*self.microns_per_pixel,-2076/2*self.microns_per_pixel,3088*self.microns_per_pixel,2076*self.microns_per_pixel)
+        # print(self.imItem.viewRect())
 
         # For the mosaic view
         self.mosaic_plotItem = self.map_view_area.getPlotItem()
@@ -684,8 +693,8 @@ class MicroscopeApp(uiclass, baseclass):
     def update_position_marker(self,xpos,ypos):
         """ Updates the location and text of the marker for the actual position in the map view"""
         for arrow in self.position_arrows:
-            arrow.setPos(xpos,ypos)
-            self.posmarker_text.setPos(xpos,ypos)
+            arrow.setPos(-xpos,ypos)
+            self.posmarker_text.setPos(-xpos,ypos)
             self.posmarker_text.setText('[%0.2f, %0.2f]' % (xpos, ypos))
 
         
@@ -801,10 +810,10 @@ class MicroscopeApp(uiclass, baseclass):
         pos = event
         if self.mosaic_plotItem.sceneBoundingRect().contains(pos):
             mousePoint = self.mosaic_plotItem.vb.mapSceneToView(pos)
-            i = mousePoint.y()
-            j = mousePoint.x()
-        self.mosaic_crosshair_hLine.setPos(i)
-        self.mosaic_crosshair_vLine.setPos(j)
+            i = mousePoint.x()
+            j = mousePoint.y()
+        self.mosaic_crosshair_hLine.setPos(j)
+        self.mosaic_crosshair_vLine.setPos(i)
         self.map_view_area.setTitle("Cursor position: (%0.2f, %0.2f)"  % (i, j))
 
     def click_move_enable(self):
@@ -821,10 +830,15 @@ class MicroscopeApp(uiclass, baseclass):
         newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel+self.motor_worker.ypos
 
         if self.motor_worker.unit == units.microns:
-            tr.reset()
-            tr.translate(newdx,newdy)
-            tr.scale(self.microns_per_pixel,self.microns_per_pixel)
-            self.imItem.setTransform(tr)
+            # tr.reset()
+            # tr.translate(newdx,newdy)
+            # tr.scale(self.microns_per_pixel,self.microns_per_pixel)
+            # self.imItem.setTransform(tr)
+            self.imItem.setRect(newdx,
+                                newdy,
+                                self.camera_worker.camera.image_width*self.microns_per_pixel,
+                                self.camera_worker.camera.image_height*self.microns_per_pixel)
+
             self.crosshair_vLine.setPos(self.motor_worker.xpos*-1.0)
             self.crosshair_hLine.setPos(self.motor_worker.ypos)
             # self.crosshair_hLine.setZValue(1)
@@ -961,21 +975,8 @@ class MicroscopeApp(uiclass, baseclass):
 
     @Slot()
     def register_image_to_map(self):
-        # Grab an image
-        # downscale = 4
+        # Grab the image item from worker thread
         if self.camera_start_button.isChecked():
-            # newdx = -self.camera_worker.camera.image_width/2*self.microns_per_pixel*downscale-self.motor_worker.xpos
-            # newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel*downscale+self.motor_worker.ypos
-
-            # image = self.camera_worker.camera.image
-            # image = resize(image, (image.shape[0] // downscale, image.shape[1] // downscale), anti_aliasing=False)
-
-            # self.mosaic_images.append(pg.ImageItem(image=image))
-            # tr = QtGui.QTransform()
-            # tr.translate(newdx,newdy)
-            # tr.scale(self.microns_per_pixel*downscale,self.microns_per_pixel*downscale)
-            # self.mosaic_images[-1].setTransform(tr)
-
             self.mosaic_images.append(self.worker.new_image_item)
             self.map_view_area.addItem(self.mosaic_images[-1])
             self.mosaic_images[-1].setZValue(-1*len(self.mosaic_images))
@@ -985,27 +986,60 @@ class MicroscopeApp(uiclass, baseclass):
 
     def set_mosaic_corner1(self):
         self.mosaic_corner1 = (self.motor_worker.xpos,self.motor_worker.ypos)
-    def set_mosaic_corner2(self):
-        self.mosaic_corner2 = (self.motor_worker.xpos,self.motor_worker.ypos)
+        self.corner1_x_label.setText(f"X: {round(self.mosaic_corner1[0],2)} μm")
+        self.corner1_y_label.setText(f"Y: {round(self.mosaic_corner1[1],2)} μm")
 
-    def start_mosaic(self):
-        # TODO: Put back the NOT condition
-        if self.mosaic_corner1 or self.mosaic_corner2 is None:
-            size_x = 4*self.camera_worker.camera.image_width*self.microns_per_pixel
-            size_y = 3*self.camera_worker.camera.image_height*self.microns_per_pixel
+        if self.mosaic_corner1 and self.mosaic_corner2 is not None:
+            size_x = self.mosaic_corner2[0]-self.mosaic_corner1[0]
+            size_y = self.mosaic_corner2[1]-self.mosaic_corner1[1]
 
             dx = self.camera_worker.camera.image_width*self.microns_per_pixel
             dy = self.camera_worker.camera.image_height*self.microns_per_pixel
 
-            xpos = np.arange(start=0,stop=size_x,step=dx)
-            ypos = np.arange(start=0,stop=size_y,step=dy)
-            xv, yv = np.meshgrid(xpos, ypos)
-            xvec = xv.ravel()
-            yvec = yv.ravel()
+            xlen = len(np.arange(self.mosaic_corner1[0], self.mosaic_corner2[0], np.sign(size_x)*dx))
+            ylen = len(np.arange(self.mosaic_corner1[1], self.mosaic_corner2[1], np.sign(size_y)*dy))
+
+            N = xlen*ylen
+            self.mosaic_numofimages_label.setText(f"Number of images: {N}")
+            self.mosaic_size_label.setText(f"Size: {round(size_x,2)}x{round(size_y,2)} μm")
+
+    def set_mosaic_corner2(self):
+        self.mosaic_corner2 = (self.motor_worker.xpos,self.motor_worker.ypos)
+        self.corner2_x_label.setText(f"X: {round(self.mosaic_corner2[0],2)} μm")
+        self.corner2_y_label.setText(f"Y: {round(self.mosaic_corner2[1],2)} μm")
+
+        if self.mosaic_corner1 and self.mosaic_corner2 is not None:
+            size_x = self.mosaic_corner2[0]-self.mosaic_corner1[0]
+            size_y = self.mosaic_corner2[1]-self.mosaic_corner1[1]
+
+            dx = self.camera_worker.camera.image_width*self.microns_per_pixel
+            dy = self.camera_worker.camera.image_height*self.microns_per_pixel
+
+            xlen = len(np.arange(self.mosaic_corner1[0], self.mosaic_corner2[0], np.sign(size_x)*dx))
+            ylen = len(np.arange(self.mosaic_corner1[1], self.mosaic_corner2[1], np.sign(size_y)*dy))
+
+            N = xlen*ylen
+            self.mosaic_numofimages_label.setText(f"Number of images: {N}")
+            self.mosaic_size_label.setText(f"Size: {round(size_x,2)}x{round(size_y,2)} μm")
+
+    def start_mosaic(self):
+        if self.mosaic_corner1 and self.mosaic_corner2 is not None:
+            size_x = self.mosaic_corner2[0]-self.mosaic_corner1[0]
+            size_y = self.mosaic_corner2[1]-self.mosaic_corner1[1]
+
+            # TODO: Create a FOV property
+            dx = self.camera_worker.camera.image_width*self.microns_per_pixel
+            dy = self.camera_worker.camera.image_height*self.microns_per_pixel
+
+            # xpos = np.arange(start=0,stop=size_x,step=dx)
+            # ypos = np.arange(start=0,stop=size_y,step=dy)
+            # xv, yv = np.meshgrid(xpos, ypos)
+            # xvec = xv.ravel()
+            # yvec = yv.ravel()
 
             # define some grids
-            xgrid = np.arange(0, size_x, dx)
-            ygrid = np.arange(0, size_y, dy)
+            xgrid = np.arange(self.mosaic_corner1[0], self.mosaic_corner2[0], np.sign(size_x)*dx)
+            ygrid = np.arange(self.mosaic_corner1[1], self.mosaic_corner2[1], np.sign(size_y)*dy)
 
             xscan = []
             yscan = []
