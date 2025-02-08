@@ -1595,9 +1595,9 @@
                 <number>2</number>
                </property>
                <item>
-                <widget class="QPushButton" name="saveimages_button">
+                <widget class="QPushButton" name="clear_mosaic_button">
                  <property name="text">
-                  <string>PushButton</string>
+                  <string>Clear</string>
                  </property>
                 </widget>
                </item>
