@@ -575,6 +575,7 @@ class MicroscopeApp(uiclass, baseclass):
             self.start_mosaic_signal.connect(self.worker.measure_mosaic)
             self.corner1_set_button.clicked.connect(self.set_mosaic_corner1)
             self.corner2_set_button.clicked.connect(self.set_mosaic_corner2)
+            self.clear_mosaic_button.clicked.connect(self.clear_mosaic)
             # Worker move signals
             self.worker.move_signal.connect(self.motor_worker.move_to_point)
             self.worker.motorspeed_change_signal.connect(self.motor_worker.on_speed_selection_changed)
@@ -830,10 +831,6 @@ class MicroscopeApp(uiclass, baseclass):
         newdy = -self.camera_worker.camera.image_height/2*self.microns_per_pixel+self.motor_worker.ypos
 
         if self.motor_worker.unit == units.microns:
-            # tr.reset()
-            # tr.translate(newdx,newdy)
-            # tr.scale(self.microns_per_pixel,self.microns_per_pixel)
-            # self.imItem.setTransform(tr)
             self.imItem.setRect(newdx,
                                 newdy,
                                 self.camera_worker.camera.image_width*self.microns_per_pixel,
@@ -841,8 +838,6 @@ class MicroscopeApp(uiclass, baseclass):
 
             self.crosshair_vLine.setPos(self.motor_worker.xpos*-1.0)
             self.crosshair_hLine.setPos(self.motor_worker.ypos)
-            # self.crosshair_hLine.setZValue(1)
-            # self.crosshair_vLine.setZValue(1)
         elif self.motor_worker.unit == units.steps:
             pass
 
@@ -1031,12 +1026,6 @@ class MicroscopeApp(uiclass, baseclass):
             dx = self.camera_worker.camera.image_width*self.microns_per_pixel
             dy = self.camera_worker.camera.image_height*self.microns_per_pixel
 
-            # xpos = np.arange(start=0,stop=size_x,step=dx)
-            # ypos = np.arange(start=0,stop=size_y,step=dy)
-            # xv, yv = np.meshgrid(xpos, ypos)
-            # xvec = xv.ravel()
-            # yvec = yv.ravel()
-
             # define some grids
             xgrid = np.arange(self.mosaic_corner1[0], self.mosaic_corner2[0], np.sign(size_x)*dx)
             ygrid = np.arange(self.mosaic_corner1[1], self.mosaic_corner2[1], np.sign(size_y)*dy)
@@ -1064,6 +1053,13 @@ class MicroscopeApp(uiclass, baseclass):
             msg.setStandardButtons(QMessageBox.Close)
             msg.setInformativeText("Set both corner points of the mosaic map and start again!")
             msg.exec()
+
+    def clear_mosaic(self):
+        for image in self.mosaic_images:
+            self.map_view_area.removeItem(image)
+            image.deleteLater()
+        self.mosaic_images = []
+        logging.info("Mosaic cleared!")
 
 # OTHER FUNCTIONS
     def load_config(self):
