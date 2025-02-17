@@ -1,0 +1,8 @@
+pyserial
+pyqtgraph
+pyside6
+ids_peak
+pyyaml
+scikit-image
+numpy
+pyspacemouse
