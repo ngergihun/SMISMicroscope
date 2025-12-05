@@ -1,10 +1,14 @@
 """A module that contains the Motor class, which is the base class for all motors."""
 from .cmd import get_, set_, mov_, move_modes
+from .device import DeviceWithAddress
 from .tools import error_check, move_check, is_null_or_empty
 from .errors import ExternalDeviceNotFound
 
-class BaseMotor:
+class BaseMotor(DeviceWithAddress):
     """A class that represents a general stepper motor motor. Each device inherits from this class."""
+    def __init__(self, controller, address="0", debug=False):
+        super().__init__(controller, address=address, debug=debug)
+
     def move(self):
         raise NotImplementedError
     
@@ -16,47 +20,7 @@ class BaseMotor:
 
 class Motor(BaseMotor):
     def __init__(self, controller, address="0", debug=False):
-        super().__init__()
-        # the controller object which services the COM port
-        self.controller = controller
-        self.address = address
-        self.debug = debug
-
-    def send_command(self, instruction, message=None):
-        """Sends an instruction to the motor. Returns the response from the motor."""
-        if message is not None:
-            fullmessage = self.address + " " + message
-        else:
-            fullmessage = self.address
-            
-        cstatus = self.controller.send_instruction(instruction, message = fullmessage)
-        status = self.translate_response(status=cstatus, debug=self.debug)
- 
-        return status
-    
-    def translate_response(self, status, debug=False):
-        """Parses the message from the controller."""
-        code = status[0]
-        fulldata = status[1]
-        if debug:
-            print(f'Code: {code}')
-            print(f'Data (str): {fulldata}')
-
-        try:
-            addr = int(fulldata[0])
-        except ValueError as exc:
-            raise ValueError(f"Invalid Address: {status[1]}.") from exc
-        
-        addr = int(fulldata[0])
-        data = [int(d) for d in fulldata[1:]]
-
-        if debug:
-            print(f'Parsed Address: {addr}')
-            print(f'Parsed Data: {data}')
-
-        return (code, addr, data)
-    
-        # Basic functions
+        super().__init__(controller, address=address, debug=debug)
     
     def move(self, req="relative", data="0"):
         """Function initiate motor movement.
