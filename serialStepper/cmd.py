@@ -30,6 +30,16 @@ mov_ = {
     "autotune": "at",
 }
 
+shutter_ = {
+    "move": "MV",
+    "set_position": "SP",
+    "get_position": "GP",
+}
+
+switch_ = {
+    "get_state": "GS"
+}
+
 class move_modes(Enum):
     soft = 0
     ramp = 1
