@@ -163,6 +163,7 @@ class Controller(BaseSerialController):
             command = command.encode()
 
         if command:
+            self.s.reset_input_buffer()
             if self.debug:
                 print("TX:", command)
             # Execute the command and wait for a response
