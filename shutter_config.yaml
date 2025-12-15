@@ -1,7 +1,7 @@
 port: COM5
 shutters:
   ir1:
-    name: SimpleShutter
+    name: SimpleShutter1
     pos_A_name: Power Meter
     pos_B_name: Input
     servo_A: 120
@@ -9,11 +9,11 @@ shutters:
     servo_tol: 5
     sensor_open: 1
     servo_open: 1
-    adress_servo: 0
+    address_servo: 0
     address_sensor: 1
     default_state: A
   ir2:
-    name: SimpleShutter
+    name: SimpleShutter2
     pos_A_name: NanoFTIR
     pos_B_name: NIM
     servo_A: 120
@@ -21,8 +21,8 @@ shutters:
     servo_tol: 5
     sensor_open: 1
     servo_open: 1
-    adress_servo: 1
-    address_sensor: 
+    address_servo: 1
+    address_sensor: 2
     default_state: B
 sensors:
 servos:
